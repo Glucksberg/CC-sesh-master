@@ -1,0 +1,7 @@
+logs/*.jsonl
+logs/*.log
+logs/*.md
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store

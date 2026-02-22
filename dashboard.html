@@ -1,0 +1,2472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Process Monitor</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@400;700&display=swap');
+
+        :root {
+            --bg-primary: #0a0e14;
+            --bg-secondary: #0d1117;
+            --bg-tertiary: #151b23;
+            --bg-card: #1a2332;
+            --border-color: #2d3748;
+            --border-glow: #00ff8855;
+
+            --phosphor-green: #00ff88;
+            --phosphor-dim: #00cc6a;
+            --phosphor-bright: #66ffbb;
+
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+
+            --spawn-color: #00ff88;
+            --exit-color: #ff4757;
+            --anomaly-color: #ffa502;
+            --state-color: #3b82f6;
+            --mem-color: #a855f7;
+            --progress-color: #06b6d4;
+
+            --scanline-opacity: 0.03;
+            --glow-intensity: 0.6;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* CRT Scanline Effect */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0, 255, 136, var(--scanline-opacity)) 2px,
+                rgba(0, 255, 136, var(--scanline-opacity)) 4px
+            );
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* Vignette Effect */
+        body::after {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(ellipse at center, transparent 0%, rgba(0,0,0,0.4) 100%);
+            pointer-events: none;
+            z-index: 9998;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 30px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-bottom: 2px solid var(--phosphor-green);
+            margin-bottom: 24px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--phosphor-green), transparent);
+            animation: scanHeader 3s linear infinite;
+        }
+
+        @keyframes scanHeader {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo-icon {
+            width: 48px;
+            height: 48px;
+            border: 2px solid var(--phosphor-green);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            background: rgba(0, 255, 136, 0.1);
+            box-shadow: 0 0 20px rgba(0, 255, 136, 0.3), inset 0 0 20px rgba(0, 255, 136, 0.1);
+        }
+
+        .logo-text h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--phosphor-green);
+            text-shadow: 0 0 10px rgba(0, 255, 136, var(--glow-intensity));
+            letter-spacing: 2px;
+        }
+
+        .logo-text span {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            letter-spacing: 4px;
+            text-transform: uppercase;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 32px;
+        }
+
+        .clock {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.25rem;
+            color: var(--phosphor-bright);
+            text-shadow: 0 0 8px rgba(0, 255, 136, 0.5);
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--phosphor-green);
+            box-shadow: 0 0 10px var(--phosphor-green);
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .status-dot.disconnected {
+            background: var(--exit-color);
+            box-shadow: 0 0 10px var(--exit-color);
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(0.9); }
+        }
+
+        .status-text {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* ─── Tab Toggle ─────────────────────────────────────────────── */
+        .tab-toggle {
+            display: flex;
+            gap: 4px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 3px;
+        }
+
+        .tab-btn {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 8px 16px;
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid transparent;
+            border-radius: 2px;
+            cursor: pointer;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-secondary);
+        }
+
+        .tab-btn.active {
+            background: rgba(0, 255, 136, 0.1);
+            color: var(--phosphor-green);
+            border-color: var(--phosphor-dim);
+            text-shadow: 0 0 8px rgba(0, 255, 136, 0.4);
+        }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            padding: 24px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: var(--phosphor-green);
+            opacity: 0.8;
+        }
+
+        .stat-card:hover {
+            border-color: var(--phosphor-dim);
+            box-shadow: 0 0 30px rgba(0, 255, 136, 0.1);
+        }
+
+        .stat-card.anomaly::before {
+            background: var(--anomaly-color);
+        }
+
+        .stat-card.anomaly.active {
+            border-color: var(--anomaly-color);
+            animation: alertPulse 1s ease-in-out infinite;
+        }
+
+        @keyframes alertPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 165, 2, 0.4); }
+            50% { box-shadow: 0 0 20px 5px rgba(255, 165, 2, 0.2); }
+        }
+
+        .stat-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .stat-icon {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid var(--phosphor-dim);
+            border-radius: 4px;
+            font-size: 18px;
+        }
+
+        .stat-card.anomaly .stat-icon {
+            background: rgba(255, 165, 2, 0.1);
+            border-color: var(--anomaly-color);
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .stat-value {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--phosphor-bright);
+            text-shadow: 0 0 20px rgba(0, 255, 136, 0.4);
+            line-height: 1;
+        }
+
+        .stat-card.anomaly .stat-value {
+            color: var(--anomaly-color);
+            text-shadow: 0 0 20px rgba(255, 165, 2, 0.4);
+        }
+
+        .stat-unit {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            margin-left: 4px;
+        }
+
+        /* Main Content Grid */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .panel-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.9rem;
+            color: var(--phosphor-green);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .panel-badge {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid var(--phosphor-dim);
+            border-radius: 2px;
+            color: var(--phosphor-green);
+        }
+
+        /* Event Feed */
+        .event-feed {
+            height: 400px;
+            overflow-y: auto;
+            padding: 12px;
+        }
+
+        .event-feed::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .event-feed::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        .event-feed::-webkit-scrollbar-thumb {
+            background: var(--phosphor-dim);
+            border-radius: 3px;
+        }
+
+        .event-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            background: var(--bg-secondary);
+            border-left: 3px solid var(--phosphor-green);
+            animation: slideIn 0.3s ease-out;
+            font-size: 0.85rem;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .event-item.spawn { border-left-color: var(--spawn-color); }
+        .event-item.exit { border-left-color: var(--exit-color); }
+        .event-item.anomaly {
+            border-left-color: var(--anomaly-color);
+            background: rgba(255, 165, 2, 0.05);
+        }
+        .event-item.state-change { border-left-color: var(--state-color); }
+        .event-item.mem-change { border-left-color: var(--mem-color); }
+        .event-item.progress { border-left-color: var(--progress-color); }
+
+        .event-time {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            white-space: nowrap;
+        }
+
+        .event-type {
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 2px;
+            white-space: nowrap;
+        }
+
+        .event-type.spawn { background: rgba(0, 255, 136, 0.2); color: var(--spawn-color); }
+        .event-type.exit { background: rgba(255, 71, 87, 0.2); color: var(--exit-color); }
+        .event-type.anomaly { background: rgba(255, 165, 2, 0.2); color: var(--anomaly-color); }
+        .event-type.state-change { background: rgba(59, 130, 246, 0.2); color: var(--state-color); }
+        .event-type.mem-change { background: rgba(168, 85, 247, 0.2); color: var(--mem-color); }
+        .event-type.progress { background: rgba(6, 182, 212, 0.2); color: var(--progress-color); }
+
+        .event-details {
+            color: var(--text-secondary);
+            flex: 1;
+            word-break: break-word;
+        }
+
+        .event-pid {
+            color: var(--phosphor-green);
+            font-weight: 500;
+        }
+
+        /* Memory Chart */
+        .chart-container {
+            padding: 20px;
+            height: 400px;
+            position: relative;
+        }
+
+        .chart-canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .chart-grid {
+            position: absolute;
+            top: 20px;
+            left: 50px;
+            right: 20px;
+            bottom: 40px;
+            border-left: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .chart-grid::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background:
+                linear-gradient(var(--border-color) 1px, transparent 1px),
+                linear-gradient(90deg, var(--border-color) 1px, transparent 1px);
+            background-size: 100% 25%, 20% 100%;
+            opacity: 0.3;
+        }
+
+        .chart-y-axis {
+            position: absolute;
+            left: 0;
+            top: 20px;
+            bottom: 40px;
+            width: 45px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: flex-end;
+            padding-right: 8px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        .chart-line {
+            position: absolute;
+            top: 20px;
+            left: 50px;
+            right: 20px;
+            bottom: 40px;
+        }
+
+        .chart-line svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .chart-path {
+            fill: none;
+            stroke: var(--phosphor-green);
+            stroke-width: 2;
+            filter: drop-shadow(0 0 6px rgba(0, 255, 136, 0.6));
+        }
+
+        .chart-area {
+            fill: url(#chartGradient);
+        }
+
+        .chart-legend {
+            position: absolute;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 20px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--phosphor-green);
+        }
+
+        .legend-dot.swap {
+            background: var(--anomaly-color);
+        }
+
+        /* Process Table */
+        .process-table-container {
+            overflow-x: auto;
+        }
+
+        .process-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .process-table th {
+            padding: 14px 16px;
+            text-align: left;
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .process-table td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.85rem;
+        }
+
+        .process-table tr:hover td {
+            background: rgba(0, 255, 136, 0.03);
+        }
+
+        .process-table .pid {
+            color: var(--phosphor-green);
+            font-weight: 500;
+        }
+
+        .process-type {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 2px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .process-type.claude-code {
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--spawn-color);
+        }
+
+        .process-type.mcp-server {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--state-color);
+        }
+
+        .process-type.worker {
+            background: rgba(168, 85, 247, 0.15);
+            color: var(--mem-color);
+        }
+
+        .process-type.chroma {
+            background: rgba(6, 182, 212, 0.15);
+            color: var(--progress-color);
+        }
+
+        .memory-bar {
+            width: 80px;
+            height: 6px;
+            background: var(--bg-secondary);
+            border-radius: 3px;
+            overflow: hidden;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+
+        .memory-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--phosphor-dim), var(--phosphor-green));
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .state-badge {
+            padding: 2px 6px;
+            border-radius: 2px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+        }
+
+        .state-badge.running {
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--spawn-color);
+        }
+
+        .state-badge.sleeping {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--state-color);
+        }
+
+        .state-badge.stopped {
+            background: rgba(255, 165, 2, 0.15);
+            color: var(--anomaly-color);
+        }
+
+        /* Footer */
+        .footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 24px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-top: 2px solid var(--phosphor-dim);
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .footer-section {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+        }
+
+        .footer-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .footer-label {
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 0.7rem;
+        }
+
+        .footer-value {
+            color: var(--phosphor-green);
+            font-weight: 500;
+        }
+
+        /* Empty State */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .empty-state-text {
+            font-size: 0.9rem;
+            text-align: center;
+        }
+
+        /* Loading Animation */
+        .loading-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: var(--bg-secondary);
+            z-index: 10000;
+            overflow: hidden;
+        }
+
+        .loading-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -50%;
+            width: 50%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, var(--phosphor-green), transparent);
+            animation: loading 1.5s ease-in-out infinite;
+        }
+
+        @keyframes loading {
+            0% { left: -50%; }
+            100% { left: 100%; }
+        }
+
+        .loading-bar.hidden {
+            display: none;
+        }
+
+        /* ─── SESSION VIEWER ────────────────────────────────────────── */
+
+        .session-layout {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 20px;
+            min-height: calc(100vh - 250px);
+        }
+
+        /* Sidebar */
+        .session-sidebar {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 16px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-header .panel-title {
+            margin-bottom: 12px;
+            font-size: 0.8rem;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .filter-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .filter-input, .filter-select {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 10px;
+            border-radius: 2px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .filter-input:focus, .filter-select:focus {
+            border-color: var(--phosphor-dim);
+        }
+
+        .filter-input {
+            width: 100%;
+        }
+
+        .filter-select {
+            flex: 1;
+            min-width: 0;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%238b949e'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            padding-right: 22px;
+        }
+
+        .filter-select option {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
+        .filter-date {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 4px 6px;
+            border-radius: 2px;
+            outline: none;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .filter-date:focus {
+            border-color: var(--phosphor-dim);
+        }
+
+        /* color-scheme for dark date inputs */
+        .filter-date::-webkit-calendar-picker-indicator {
+            filter: invert(0.7);
+        }
+
+        .session-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .session-list::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .session-list::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        .session-list::-webkit-scrollbar-thumb {
+            background: var(--phosphor-dim);
+            border-radius: 3px;
+        }
+
+        .session-item {
+            padding: 10px 12px;
+            margin-bottom: 6px;
+            background: var(--bg-secondary);
+            border: 1px solid transparent;
+            border-left: 3px solid var(--border-color);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            border-radius: 0 2px 2px 0;
+        }
+
+        .session-item:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--border-color);
+        }
+
+        .session-item.selected {
+            border-left-color: var(--phosphor-green);
+            background: rgba(0, 255, 136, 0.05);
+            border-color: var(--phosphor-dim);
+        }
+
+        .session-item.active-session {
+            border-left-color: var(--phosphor-green);
+        }
+
+        .session-slug {
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .session-meta {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            flex-wrap: wrap;
+        }
+
+        .session-badge {
+            padding: 1px 6px;
+            border-radius: 2px;
+            font-size: 0.6rem;
+            font-weight: 500;
+        }
+
+        .session-badge.project {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--state-color);
+        }
+
+        .session-badge.model {
+            background: rgba(168, 85, 247, 0.15);
+            color: var(--mem-color);
+        }
+
+        .session-status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .session-status-dot.active {
+            background: var(--phosphor-green);
+            box-shadow: 0 0 6px var(--phosphor-green);
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .session-status-dot.completed {
+            background: var(--text-muted);
+        }
+
+        .session-time {
+            color: var(--text-muted);
+        }
+
+        .sidebar-footer {
+            padding: 10px 16px;
+            border-top: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            text-align: center;
+        }
+
+        .load-more-btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--phosphor-dim);
+            padding: 6px 16px;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .load-more-btn:hover {
+            border-color: var(--phosphor-dim);
+            color: var(--phosphor-green);
+        }
+
+        .load-more-btn:disabled {
+            opacity: 0.4;
+            cursor: default;
+        }
+
+        .sidebar-count {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            margin-top: 6px;
+        }
+
+        /* Session Main Area */
+        .session-main {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-width: 0;
+        }
+
+        /* Stats Bar */
+        .stats-bar {
+            display: flex;
+            gap: 20px;
+            padding: 12px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .stats-bar-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.7rem;
+        }
+
+        .stats-bar-label {
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stats-bar-value {
+            color: var(--phosphor-bright);
+            font-weight: 500;
+        }
+
+        .stats-bar-sep {
+            width: 1px;
+            height: 16px;
+            background: var(--border-color);
+        }
+
+        /* Conversation Viewer */
+        .conversation-panel {
+            flex: 1;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            min-height: 500px;
+        }
+
+        .conversation-viewer {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .conversation-viewer::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .conversation-viewer::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        .conversation-viewer::-webkit-scrollbar-thumb {
+            background: var(--phosphor-dim);
+            border-radius: 3px;
+        }
+
+        .load-earlier-btn {
+            display: block;
+            margin: 0 auto 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 6px 20px;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .load-earlier-btn:hover {
+            border-color: var(--phosphor-dim);
+            color: var(--phosphor-green);
+        }
+
+        /* Message bubbles */
+        .msg-bubble {
+            max-width: 90%;
+            padding: 10px 14px;
+            margin-bottom: 12px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            line-height: 1.5;
+            word-break: break-word;
+            white-space: pre-wrap;
+            position: relative;
+        }
+
+        .msg-user {
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-left: 3px solid var(--state-color);
+        }
+
+        .msg-user .msg-label {
+            color: var(--state-color);
+        }
+
+        .msg-assistant {
+            background: rgba(0, 255, 136, 0.04);
+            border: 1px solid rgba(0, 255, 136, 0.1);
+            border-left: 3px solid var(--phosphor-dim);
+        }
+
+        .msg-assistant .msg-label {
+            color: var(--phosphor-dim);
+        }
+
+        .msg-label {
+            font-size: 0.65rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .msg-model-tag {
+            font-size: 0.55rem;
+            padding: 1px 5px;
+            background: rgba(168, 85, 247, 0.15);
+            color: var(--mem-color);
+            border-radius: 2px;
+            font-weight: 400;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+
+        .msg-text {
+            color: var(--text-primary);
+        }
+
+        /* Tool cards */
+        .tool-card {
+            margin-bottom: 8px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .tool-card-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            cursor: pointer;
+            transition: background 0.15s;
+            user-select: none;
+        }
+
+        .tool-card-header:hover {
+            background: rgba(0, 255, 136, 0.03);
+        }
+
+        .tool-chevron {
+            font-size: 0.6rem;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+            width: 12px;
+        }
+
+        .tool-card.open .tool-chevron {
+            transform: rotate(90deg);
+        }
+
+        .tool-icon {
+            font-size: 0.7rem;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 2px;
+        }
+
+        .tool-icon.use {
+            background: rgba(0, 255, 136, 0.1);
+            color: var(--phosphor-green);
+        }
+
+        .tool-icon.result {
+            background: rgba(6, 182, 212, 0.1);
+            color: var(--progress-color);
+        }
+
+        .tool-icon.error {
+            background: rgba(255, 71, 87, 0.1);
+            color: var(--exit-color);
+        }
+
+        .tool-name {
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            flex: 1;
+        }
+
+        .tool-name-label {
+            font-size: 0.6rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .tool-card-body {
+            display: none;
+            padding: 0 12px 10px;
+            font-size: 0.75rem;
+        }
+
+        .tool-card.open .tool-card-body {
+            display: block;
+        }
+
+        .tool-content {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            padding: 8px 10px;
+            border-radius: 2px;
+            max-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            color: var(--text-secondary);
+            font-size: 0.7rem;
+            line-height: 1.4;
+        }
+
+        .tool-content::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .tool-content::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 2px;
+        }
+
+        .tool-content-label {
+            font-size: 0.6rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin: 6px 0 4px;
+        }
+
+        .show-full-btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.6rem;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--phosphor-dim);
+            padding: 2px 8px;
+            border-radius: 2px;
+            cursor: pointer;
+            margin-top: 4px;
+        }
+
+        .show-full-btn:hover {
+            border-color: var(--phosphor-dim);
+            color: var(--phosphor-green);
+        }
+
+        /* System event */
+        .sys-event {
+            text-align: center;
+            margin: 12px 0;
+            font-size: 0.65rem;
+            color: var(--text-muted);
+        }
+
+        .sys-event-badge {
+            display: inline-block;
+            padding: 3px 12px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        /* No session selected */
+        .no-session {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            min-height: 400px;
+            color: var(--text-muted);
+            gap: 12px;
+        }
+
+        .no-session-icon {
+            font-size: 48px;
+            opacity: 0.3;
+        }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .session-layout {
+                grid-template-columns: 300px 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            .header {
+                flex-direction: column;
+                gap: 16px;
+            }
+            .header-right {
+                width: 100%;
+                justify-content: space-between;
+            }
+            .session-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="loading-bar" id="loadingBar"></div>
+
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">&#x26A1;</div>
+                <div class="logo-text">
+                    <h1>CLAUDE MONITOR</h1>
+                    <span>Process Lifecycle Tracker</span>
+                </div>
+            </div>
+            <div class="tab-toggle">
+                <button class="tab-btn active" data-tab="process" onclick="switchTab('process')">PROCESS MONITOR</button>
+                <button class="tab-btn" data-tab="sessions" onclick="switchTab('sessions')">SESSION VIEWER</button>
+            </div>
+            <div class="header-right">
+                <div class="clock" id="clock">00:00:00</div>
+                <div class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span class="status-text" id="statusText">Connecting...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- ═══ PROCESS MONITOR VIEW ═══ -->
+        <div id="processMonitorView">
+            <!-- Stats Cards -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div class="stat-icon">&#x25C9;</div>
+                        <span class="stat-label">Claude Processes</span>
+                    </div>
+                    <div class="stat-value" id="statProcesses">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div class="stat-icon">&#x25A3;</div>
+                        <span class="stat-label">Total Memory</span>
+                    </div>
+                    <div class="stat-value"><span id="statMemory">0</span><span class="stat-unit">MB</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-header">
+                        <div class="stat-icon">&#x2B21;</div>
+                        <span class="stat-label">MCP Servers</span>
+                    </div>
+                    <div class="stat-value" id="statMcp">0</div>
+                </div>
+                <div class="stat-card anomaly" id="anomalyCard">
+                    <div class="stat-header">
+                        <div class="stat-icon">&#x26A0;</div>
+                        <span class="stat-label">Anomalies</span>
+                    </div>
+                    <div class="stat-value" id="statAnomalies">0</div>
+                </div>
+            </div>
+
+            <!-- Main Content -->
+            <div class="main-grid">
+                <!-- Event Feed -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <span class="panel-title">&#x25C8; Live Event Feed</span>
+                        <span class="panel-badge" id="eventCount">0 events</span>
+                    </div>
+                    <div class="event-feed" id="eventFeed">
+                        <div class="empty-state">
+                            <div class="empty-state-icon">&#x25C7;</div>
+                            <div class="empty-state-text">Waiting for events...<br>Start Claude processes to see activity</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Memory Chart -->
+                <div class="panel">
+                    <div class="panel-header">
+                        <span class="panel-title">&#x25C8; Memory Timeline</span>
+                        <span class="panel-badge" id="peakMemory">Peak: 0 MB</span>
+                    </div>
+                    <div class="chart-container">
+                        <div class="chart-y-axis" id="chartYAxis">
+                            <span>0</span>
+                            <span>0</span>
+                            <span>0</span>
+                            <span>0</span>
+                            <span>0</span>
+                        </div>
+                        <div class="chart-grid"></div>
+                        <div class="chart-line">
+                            <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                                <defs>
+                                    <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                        <stop offset="0%" style="stop-color:rgba(0,255,136,0.3)"/>
+                                        <stop offset="100%" style="stop-color:rgba(0,255,136,0)"/>
+                                    </linearGradient>
+                                </defs>
+                                <path class="chart-area" id="chartArea" d="M0,100 L100,100"></path>
+                                <path class="chart-path" id="chartPath" d="M0,100"></path>
+                            </svg>
+                        </div>
+                        <div class="chart-legend">
+                            <div class="legend-item">
+                                <div class="legend-dot"></div>
+                                <span>Memory</span>
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-dot swap"></div>
+                                <span>Swap</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Process Table -->
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">&#x25C8; Active Processes</span>
+                    <span class="panel-badge" id="processCount">0 processes</span>
+                </div>
+                <div class="process-table-container">
+                    <table class="process-table">
+                        <thead>
+                            <tr>
+                                <th>PID</th>
+                                <th>Type</th>
+                                <th>Memory</th>
+                                <th>CPU</th>
+                                <th>State</th>
+                            </tr>
+                        </thead>
+                        <tbody id="processTableBody">
+                            <tr>
+                                <td colspan="5">
+                                    <div class="empty-state">
+                                        <div class="empty-state-text">No processes detected</div>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ SESSION VIEWER VIEW ═══ -->
+        <div id="sessionViewerView" style="display:none">
+            <div class="session-layout">
+                <!-- Sidebar -->
+                <aside class="session-sidebar">
+                    <div class="sidebar-header">
+                        <div class="panel-title">&#x25C8; Sessions</div>
+                        <div class="filter-group">
+                            <input type="text" class="filter-input" id="sessionSearch"
+                                   placeholder="Search sessions..." autocomplete="off">
+                            <div class="filter-row">
+                                <select class="filter-select" id="sessionProject">
+                                    <option value="">All Projects</option>
+                                </select>
+                                <select class="filter-select" id="sessionStatus">
+                                    <option value="">All</option>
+                                    <option value="active">Active</option>
+                                    <option value="completed">Completed</option>
+                                </select>
+                            </div>
+                            <div class="filter-row">
+                                <input type="date" class="filter-date" id="sessionDateFrom" title="From date">
+                                <input type="date" class="filter-date" id="sessionDateTo" title="To date">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="session-list" id="sessionList">
+                        <div class="empty-state" style="padding:40px 20px">
+                            <div class="empty-state-icon">&#x25C7;</div>
+                            <div class="empty-state-text">Loading sessions...</div>
+                        </div>
+                    </div>
+                    <div class="sidebar-footer">
+                        <button class="load-more-btn" id="loadMoreSessions" style="display:none">Load More</button>
+                        <div class="sidebar-count" id="sessionCount"></div>
+                    </div>
+                </aside>
+
+                <!-- Main Content -->
+                <main class="session-main">
+                    <!-- Stats Bar (hidden until session selected) -->
+                    <div class="stats-bar" id="sessionStatsBar" style="display:none"></div>
+
+                    <!-- Conversation Panel -->
+                    <div class="conversation-panel">
+                        <div class="panel-header">
+                            <span class="panel-title" id="conversationTitle">&#x25C8; Conversation</span>
+                            <span class="panel-badge" id="conversationBadge">Select a session</span>
+                        </div>
+                        <div class="conversation-viewer" id="conversationViewer">
+                            <div class="no-session">
+                                <div class="no-session-icon">&#x2B21;</div>
+                                <div>Select a session to view its conversation</div>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-section">
+                <div class="footer-item">
+                    <span class="footer-label">Session:</span>
+                    <span class="footer-value" id="sessionId">&mdash;</span>
+                </div>
+                <div class="footer-item">
+                    <span class="footer-label">Duration:</span>
+                    <span class="footer-value" id="duration">00:00:00</span>
+                </div>
+            </div>
+            <div class="footer-section">
+                <div class="footer-item">
+                    <span class="footer-label">Poll:</span>
+                    <span class="footer-value">2s</span>
+                </div>
+                <div class="footer-item">
+                    <span class="footer-label">Endpoint:</span>
+                    <span class="footer-value">localhost:37778</span>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        // ═══════════════════════════════════════════════════════════════
+        // Configuration
+        // ═══════════════════════════════════════════════════════════════
+        const API_URL = 'http://localhost:37778/api/tracker';
+        const SESSION_API = 'http://localhost:37778/api/sessions';
+        const POLL_INTERVAL = 2000;
+        const SESSION_LIST_POLL = 10000;
+        const SESSION_EVENTS_POLL = 3000;
+        const MAX_EVENTS = 100;
+        const MAX_CHART_POINTS = 60;
+
+        const VALID_EVENT_TYPES = new Set(['spawn', 'exit', 'anomaly', 'state-change', 'mem-change', 'progress', 'unknown']);
+        const VALID_PROCESS_TYPES = new Set(['claude-code', 'mcp-server', 'worker', 'chroma', 'other']);
+
+        // ═══════════════════════════════════════════════════════════════
+        // State
+        // ═══════════════════════════════════════════════════════════════
+        let events = [];
+        let memoryHistory = [];
+        let swapHistory = [];
+        let isConnected = false;
+        let sessionStart = Date.now();
+        let peakMemory = 0;
+        let seenEventKeys = new Set();
+        let demoModeInterval = null;
+
+        // Tab state
+        let activeTab = 'process';
+        let processPollingId = null;
+        let sessionListPollingId = null;
+        let sessionEventsPollingId = null;
+
+        // Session viewer state
+        let svSessions = [];
+        let svSelectedId = null;
+        let svEvents = [];
+        let svLastEventUUID = null;
+        let svAutoScroll = true;
+        let svOffset = 0;
+        let svTotal = 0;
+        let svProjects = [];
+        let svSearchTimer = null;
+
+        // ═══════════════════════════════════════════════════════════════
+        // Helpers
+        // ═══════════════════════════════════════════════════════════════
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return '';
+            return String(unsafe)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        function sanitizeEventType(raw) {
+            const n = (raw || 'unknown').toLowerCase().replace(/_/g, '-');
+            return VALID_EVENT_TYPES.has(n) ? n : 'unknown';
+        }
+
+        function sanitizeProcessType(raw) {
+            const n = (raw || 'other').toLowerCase().replace(/_/g, '-');
+            return VALID_PROCESS_TYPES.has(n) ? n : 'other';
+        }
+
+        function timeAgo(mtime) {
+            const seconds = Math.floor((Date.now() / 1000) - mtime);
+            if (seconds < 60) return 'just now';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+            if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+            return Math.floor(seconds / 86400) + 'd ago';
+        }
+
+        function formatDuration(seconds) {
+            if (!seconds || seconds < 0) return '0s';
+            if (seconds < 60) return seconds + 's';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            return h + 'h ' + m + 'm';
+        }
+
+        function formatTokens(n) {
+            if (!n) return '0';
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+            return String(n);
+        }
+
+        function shortModel(m) {
+            if (!m) return '';
+            // claude-sonnet-4-6-20250514 -> sonnet-4.6
+            const match = m.match(/(opus|sonnet|haiku)[- ]?(\d+)[- .]?(\d+)?/i);
+            if (match) {
+                const name = match[1].toLowerCase();
+                const ver = match[3] ? match[2] + '.' + match[3] : match[2];
+                return name + '-' + ver;
+            }
+            return m.split('-').slice(-2).join('-');
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // DOM Elements
+        // ═══════════════════════════════════════════════════════════════
+        const loadingBar = document.getElementById('loadingBar');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const clock = document.getElementById('clock');
+        const statProcesses = document.getElementById('statProcesses');
+        const statMemory = document.getElementById('statMemory');
+        const statMcp = document.getElementById('statMcp');
+        const statAnomalies = document.getElementById('statAnomalies');
+        const anomalyCard = document.getElementById('anomalyCard');
+        const eventFeed = document.getElementById('eventFeed');
+        const eventCount = document.getElementById('eventCount');
+        const chartPath = document.getElementById('chartPath');
+        const chartArea = document.getElementById('chartArea');
+        const chartYAxis = document.getElementById('chartYAxis');
+        const peakMemoryEl = document.getElementById('peakMemory');
+        const processTableBody = document.getElementById('processTableBody');
+        const processCount = document.getElementById('processCount');
+        const sessionIdEl = document.getElementById('sessionId');
+        const durationEl = document.getElementById('duration');
+
+        // ═══════════════════════════════════════════════════════════════
+        // Clock & Duration
+        // ═══════════════════════════════════════════════════════════════
+        function updateClock() {
+            const now = new Date();
+            clock.textContent = now.toLocaleTimeString('en-US', { hour12: false });
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        function updateDuration() {
+            const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
+            const h = Math.floor(elapsed / 3600);
+            const m = Math.floor((elapsed % 3600) / 60);
+            const s = elapsed % 60;
+            durationEl.textContent =
+                String(h).padStart(2, '0') + ':' +
+                String(m).padStart(2, '0') + ':' +
+                String(s).padStart(2, '0');
+        }
+        setInterval(updateDuration, 1000);
+
+        // ═══════════════════════════════════════════════════════════════
+        // Tab Switching
+        // ═══════════════════════════════════════════════════════════════
+        function switchTab(tab) {
+            activeTab = tab;
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                b.classList.toggle('active', b.dataset.tab === tab);
+            });
+
+            const processView = document.getElementById('processMonitorView');
+            const sessionView = document.getElementById('sessionViewerView');
+
+            if (tab === 'process') {
+                processView.style.display = '';
+                sessionView.style.display = 'none';
+                stopSessionPolling();
+                startProcessPolling();
+            } else {
+                processView.style.display = 'none';
+                sessionView.style.display = '';
+                startSessionPolling();
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Connection Status
+        // ═══════════════════════════════════════════════════════════════
+        function setConnectionStatus(connected) {
+            isConnected = connected;
+            if (connected) {
+                statusDot.classList.remove('disconnected');
+                statusText.textContent = 'Connected';
+                loadingBar.classList.add('hidden');
+            } else {
+                statusDot.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+                loadingBar.classList.remove('hidden');
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Process Monitor (existing logic)
+        // ═══════════════════════════════════════════════════════════════
+        function formatTime(isoString) {
+            if (!isoString) return '--:--:--';
+            const d = new Date(isoString);
+            return d.toLocaleTimeString('en-US', { hour12: false });
+        }
+
+        function addEvent(event) {
+            events.unshift(event);
+            if (events.length > MAX_EVENTS) events.pop();
+            renderEvents();
+        }
+
+        function renderEvents() {
+            if (events.length === 0) {
+                eventFeed.innerHTML = '<div class="empty-state"><div class="empty-state-icon">&#x25C7;</div><div class="empty-state-text">Waiting for events...<br>Start Claude processes to see activity</div></div>';
+                return;
+            }
+            eventFeed.innerHTML = events.map(e => {
+                const et = sanitizeEventType(e.event);
+                const pid = e.pid ? '<span class="event-pid">PID:' + escapeHtml(e.pid) + '</span>' : '';
+                return '<div class="event-item ' + et + '"><span class="event-time">' + formatTime(e.ts) +
+                    '</span><span class="event-type ' + et + '">' + escapeHtml(e.event || 'UNKNOWN') +
+                    '</span><span class="event-details">' + pid + ' ' + escapeHtml(e.details || '') + '</span></div>';
+            }).join('');
+            eventCount.textContent = events.length + ' events';
+        }
+
+        function updateChart(memory, swap) {
+            memoryHistory.push(memory);
+            swapHistory.push(swap || 0);
+            if (memoryHistory.length > MAX_CHART_POINTS) {
+                memoryHistory.shift();
+                swapHistory.shift();
+            }
+            if (memory > peakMemory) {
+                peakMemory = memory;
+                peakMemoryEl.textContent = 'Peak: ' + peakMemory + ' MB';
+            }
+            const maxVal = Math.max(...memoryHistory, 100);
+            const yScale = Math.max(Math.ceil(maxVal / 4) * 4, 4);
+            const yLabels = chartYAxis.querySelectorAll('span');
+            for (let i = 0; i < yLabels.length; i++) {
+                yLabels[i].textContent = Math.round(yScale * (1 - i / 4));
+            }
+            if (memoryHistory.length < 2) return;
+            const pts = memoryHistory.map((v, i) => {
+                const x = (i / (MAX_CHART_POINTS - 1)) * 100;
+                const y = 100 - (v / yScale) * 100;
+                return x + ',' + y;
+            });
+            chartPath.setAttribute('d', 'M' + pts.join(' L'));
+            chartArea.setAttribute('d', 'M0,100 L' + pts.join(' L') + ' L100,100 Z');
+        }
+
+        function parseCounts(str) {
+            const c = { claude: 0, mcp: 0, worker: 0, chroma: 0 };
+            if (!str) return c;
+            str.split(',').forEach(p => {
+                const [k, v] = p.split(':');
+                if (k && v) c[k.trim()] = parseInt(v) || 0;
+            });
+            return c;
+        }
+
+        function renderProcessTable(processes) {
+            if (!processes || !processes.length) {
+                processTableBody.innerHTML = '<tr><td colspan="5"><div class="empty-state"><div class="empty-state-text">No processes detected</div></div></td></tr>';
+                processCount.textContent = '0 processes';
+                return;
+            }
+            processTableBody.innerHTML = processes.map(p => {
+                const tc = sanitizeProcessType(p.type);
+                const mem = parseInt(p.memory) || 0;
+                const cpu = parseFloat(p.cpu) || 0;
+                const pct = Math.min((mem / 1000) * 100, 100);
+                const sc = p.state === 'R' ? 'running' : (p.state === 'T' ? 'stopped' : 'sleeping');
+                const sl = p.state === 'R' ? 'RUN' : (p.state === 'T' ? 'STOP' : 'SLEEP');
+                return '<tr><td class="pid">' + escapeHtml(p.pid) + '</td><td><span class="process-type ' + tc + '">' +
+                    escapeHtml(p.type || 'unknown') + '</span></td><td><div class="memory-bar"><div class="memory-bar-fill" style="width:' +
+                    pct + '%"></div></div>' + mem + ' MB</td><td>' + cpu.toFixed(1) + '%</td><td><span class="state-badge ' + sc + '">' + sl + '</span></td></tr>';
+            }).join('');
+            processCount.textContent = processes.length + ' processes';
+        }
+
+        async function fetchData() {
+            const ctrl = new AbortController();
+            const tid = setTimeout(() => ctrl.abort(), 5000);
+            try {
+                const res = await fetch(API_URL + '/status', { signal: ctrl.signal });
+                clearTimeout(tid);
+                if (!res.ok) throw new Error('API error');
+                const data = await res.json();
+                setConnectionStatus(true);
+                stopDemoMode();
+
+                const counts = parseCounts(data.counts);
+                statProcesses.textContent = counts.claude || 0;
+                statMemory.textContent = data.total_mem_mb || 0;
+                statMcp.textContent = counts.mcp || 0;
+                const anomalies = data.anomaly_count || 0;
+                statAnomalies.textContent = anomalies;
+                anomalyCard.classList.toggle('active', anomalies > 0);
+
+                if (data.session_id) sessionIdEl.textContent = data.session_id;
+                updateChart(data.total_mem_mb || 0, data.system?.swap_used_mb);
+                renderProcessTable(data.processes || []);
+
+                if (data.recent_events) {
+                    data.recent_events.forEach(e => {
+                        const key = e.ts + '-' + e.event + '-' + (e.pid || '');
+                        if (!seenEventKeys.has(key)) {
+                            seenEventKeys.add(key);
+                            addEvent(e);
+                            if (seenEventKeys.size > MAX_EVENTS * 2) {
+                                seenEventKeys = new Set(Array.from(seenEventKeys).slice(-MAX_EVENTS));
+                            }
+                        }
+                    });
+                }
+            } catch (err) {
+                clearTimeout(tid);
+                setConnectionStatus(false);
+            }
+        }
+
+        function stopDemoMode() {
+            if (demoModeInterval) {
+                clearInterval(demoModeInterval);
+                demoModeInterval = null;
+            }
+        }
+
+        function runDemoMode() {
+            if (demoModeInterval) return;
+            sessionIdEl.textContent = 'DEMO_' + Date.now();
+            const evTypes = ['SPAWN', 'EXIT', 'STATE_CHANGE', 'MEM_CHANGE', 'ANOMALY'];
+            const pTypes = ['claude-code', 'mcp-server', 'worker', 'chroma'];
+            let procs = [], mem = 500, anom = 0;
+
+            demoModeInterval = setInterval(() => {
+                mem += Math.random() * 100 - 50;
+                mem = Math.max(100, Math.min(4000, mem));
+                if (Math.random() > 0.7) {
+                    const et = evTypes[Math.floor(Math.random() * evTypes.length)];
+                    const pid = Math.floor(Math.random() * 100000) + 100000;
+                    if (et === 'SPAWN') {
+                        const t = pTypes[Math.floor(Math.random() * pTypes.length)];
+                        procs.push({ pid, type: t, memory: Math.floor(Math.random() * 500) + 50, cpu: Math.random() * 10, state: 'S' });
+                        addEvent({ ts: new Date().toISOString(), event: 'SPAWN', pid: String(pid), details: t });
+                    } else if (et === 'EXIT' && procs.length > 0) {
+                        const i = Math.floor(Math.random() * procs.length);
+                        const p = procs.splice(i, 1)[0];
+                        addEvent({ ts: new Date().toISOString(), event: 'EXIT', pid: String(p.pid), details: p.type });
+                    } else if (et === 'ANOMALY') {
+                        anom++;
+                        addEvent({ ts: new Date().toISOString(), event: 'ANOMALY', pid: '', details: 'High memory: ' + Math.floor(mem) + 'MB' });
+                    }
+                }
+                statProcesses.textContent = procs.filter(p => p.type === 'claude-code').length;
+                statMemory.textContent = Math.floor(mem);
+                statMcp.textContent = procs.filter(p => p.type === 'mcp-server').length;
+                statAnomalies.textContent = anom;
+                if (anom > 0) anomalyCard.classList.add('active');
+                updateChart(Math.floor(mem), Math.floor(Math.random() * 500));
+                renderProcessTable(procs);
+            }, 2000);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Polling Management
+        // ═══════════════════════════════════════════════════════════════
+        function startProcessPolling() {
+            if (processPollingId) return;
+            fetchData();
+            processPollingId = setInterval(fetchData, activeTab === 'process' ? POLL_INTERVAL : 5000);
+        }
+
+        function stopSessionPolling() {
+            if (sessionListPollingId) { clearInterval(sessionListPollingId); sessionListPollingId = null; }
+            if (sessionEventsPollingId) { clearInterval(sessionEventsPollingId); sessionEventsPollingId = null; }
+        }
+
+        function startSessionPolling() {
+            fetchSessionList();
+            if (sessionListPollingId) clearInterval(sessionListPollingId);
+            sessionListPollingId = setInterval(fetchSessionList, SESSION_LIST_POLL);
+
+            if (svSelectedId) startEventPolling();
+        }
+
+        function startEventPolling() {
+            if (sessionEventsPollingId) clearInterval(sessionEventsPollingId);
+            sessionEventsPollingId = setInterval(() => {
+                if (svSelectedId && svAutoScroll) pollNewEvents();
+            }, SESSION_EVENTS_POLL);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Session List
+        // ═══════════════════════════════════════════════════════════════
+        async function fetchSessionList() {
+            const params = new URLSearchParams();
+            const search = document.getElementById('sessionSearch').value;
+            const project = document.getElementById('sessionProject').value;
+            const status = document.getElementById('sessionStatus').value;
+            const dateFrom = document.getElementById('sessionDateFrom').value;
+            const dateTo = document.getElementById('sessionDateTo').value;
+
+            if (search) params.set('search', search);
+            if (project) params.set('project', project);
+            if (status) params.set('status', status);
+            if (dateFrom) params.set('date_from', dateFrom);
+            if (dateTo) params.set('date_to', dateTo);
+            params.set('offset', '0');
+            params.set('limit', '50');
+
+            try {
+                const res = await fetch(SESSION_API + '/list?' + params.toString());
+                if (!res.ok) throw new Error('Failed');
+                const data = await res.json();
+                setConnectionStatus(true);
+
+                svSessions = data.sessions || [];
+                svTotal = data.total || 0;
+                svOffset = svSessions.length;
+                svProjects = data.projects || [];
+
+                renderSessionList();
+                populateProjectFilter();
+            } catch (err) {
+                console.error('Session list error:', err);
+            }
+        }
+
+        function populateProjectFilter() {
+            const sel = document.getElementById('sessionProject');
+            const current = sel.value;
+            const opts = ['<option value="">All Projects</option>'];
+            svProjects.forEach(p => {
+                opts.push('<option value="' + escapeHtml(p) + '"' + (p === current ? ' selected' : '') + '>' + escapeHtml(p) + '</option>');
+            });
+            sel.innerHTML = opts.join('');
+        }
+
+        function renderSessionList() {
+            const list = document.getElementById('sessionList');
+            if (svSessions.length === 0) {
+                list.innerHTML = '<div class="empty-state" style="padding:40px 20px"><div class="empty-state-icon">&#x25C7;</div><div class="empty-state-text">No sessions found</div></div>';
+            } else {
+                list.innerHTML = svSessions.map(s => {
+                    const sel = s.sessionId === svSelectedId ? ' selected' : '';
+                    const active = s.status === 'active' ? ' active-session' : '';
+                    const slug = escapeHtml(s.slug || s.sessionId.slice(0, 8));
+                    const proj = escapeHtml(s.project || '');
+                    const model = shortModel(s.model);
+                    return '<div class="session-item' + sel + active + '" data-id="' + escapeHtml(s.sessionId) + '" onclick="selectSession(\'' + escapeHtml(s.sessionId) + '\')">' +
+                        '<div class="session-slug">' + slug + '</div>' +
+                        '<div class="session-meta">' +
+                        '<span class="session-status-dot ' + (s.status === 'active' ? 'active' : 'completed') + '"></span>' +
+                        (proj ? '<span class="session-badge project">' + proj + '</span>' : '') +
+                        (model ? '<span class="session-badge model">' + escapeHtml(model) + '</span>' : '') +
+                        '<span class="session-time">' + timeAgo(s.mtime) + '</span>' +
+                        '</div></div>';
+                }).join('');
+            }
+
+            // Load more button
+            const btn = document.getElementById('loadMoreSessions');
+            btn.style.display = svOffset < svTotal ? '' : 'none';
+            document.getElementById('sessionCount').textContent = svSessions.length + ' of ' + svTotal + ' sessions';
+        }
+
+        async function loadMoreSessions() {
+            const btn = document.getElementById('loadMoreSessions');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+
+            const params = new URLSearchParams();
+            const search = document.getElementById('sessionSearch').value;
+            const project = document.getElementById('sessionProject').value;
+            const status = document.getElementById('sessionStatus').value;
+            if (search) params.set('search', search);
+            if (project) params.set('project', project);
+            if (status) params.set('status', status);
+            params.set('offset', String(svOffset));
+            params.set('limit', '50');
+
+            try {
+                const res = await fetch(SESSION_API + '/list?' + params.toString());
+                const data = await res.json();
+                svSessions = svSessions.concat(data.sessions || []);
+                svOffset = svSessions.length;
+                renderSessionList();
+            } catch (err) {
+                console.error('Load more error:', err);
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Load More';
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Session Selection & Events
+        // ═══════════════════════════════════════════════════════════════
+        async function selectSession(id) {
+            if (svSelectedId === id) return;
+            svSelectedId = id;
+            svEvents = [];
+            svLastEventUUID = null;
+            svAutoScroll = true;
+
+            // Update selection in list
+            document.querySelectorAll('.session-item').forEach(el => {
+                el.classList.toggle('selected', el.dataset.id === id);
+            });
+
+            // Show loading
+            const viewer = document.getElementById('conversationViewer');
+            viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">Loading conversation...</div></div>';
+
+            // Fetch events and stats in parallel
+            const session = svSessions.find(s => s.sessionId === id);
+            document.getElementById('conversationTitle').innerHTML = '&#x25C8; ' + escapeHtml(session?.slug || id.slice(0, 8));
+
+            try {
+                const [evRes, stRes] = await Promise.all([
+                    fetch(SESSION_API + '/' + id + '/events?limit=100'),
+                    fetch(SESSION_API + '/' + id + '/stats'),
+                ]);
+
+                if (evRes.ok) {
+                    const evData = await evRes.json();
+                    svEvents = evData.events || [];
+                    if (svEvents.length > 0) {
+                        svLastEventUUID = svEvents[svEvents.length - 1].uuid;
+                    }
+                    renderConversation();
+                }
+
+                if (stRes.ok) {
+                    const stats = await stRes.json();
+                    renderStatsBar(stats);
+                }
+
+                startEventPolling();
+            } catch (err) {
+                console.error('Session load error:', err);
+                viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">Error loading session</div></div>';
+            }
+        }
+
+        async function pollNewEvents() {
+            if (!svSelectedId || !svLastEventUUID) return;
+            try {
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?after=' + svLastEventUUID + '&limit=50');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.events && data.events.length > 0) {
+                    svEvents = svEvents.concat(data.events);
+                    svLastEventUUID = data.events[data.events.length - 1].uuid;
+
+                    // DOM limit
+                    if (svEvents.length > 500) {
+                        svEvents = svEvents.slice(-500);
+                    }
+
+                    renderConversation();
+                    updateConversationBadge();
+                }
+            } catch (err) {
+                // Silent retry
+            }
+        }
+
+        async function loadEarlierEvents() {
+            if (!svSelectedId || svEvents.length === 0) return;
+            const firstUUID = svEvents[0].uuid;
+            // We need to fetch events before the first one
+            // The API reads from the end, so we fetch more and filter
+            try {
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?limit=200');
+                if (!res.ok) return;
+                const data = await res.json();
+                const allEvents = data.events || [];
+
+                // Find events before our first event
+                const firstIdx = allEvents.findIndex(e => e.uuid === firstUUID);
+                if (firstIdx > 0) {
+                    const earlier = allEvents.slice(0, firstIdx);
+                    svEvents = earlier.concat(svEvents);
+                    if (svEvents.length > 500) {
+                        svEvents = svEvents.slice(-500);
+                    }
+                    renderConversation(false); // Don't auto-scroll
+                }
+            } catch (err) {
+                console.error('Load earlier error:', err);
+            }
+        }
+
+        function updateConversationBadge() {
+            const badge = document.getElementById('conversationBadge');
+            const session = svSessions.find(s => s.sessionId === svSelectedId);
+            badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Stats Bar
+        // ═══════════════════════════════════════════════════════════════
+        function renderStatsBar(stats) {
+            const bar = document.getElementById('sessionStatsBar');
+            bar.style.display = '';
+
+            const items = [];
+            if (stats.model) items.push({ l: 'Model', v: shortModel(stats.model) });
+            if (stats.duration_seconds) items.push({ l: 'Duration', v: formatDuration(stats.duration_seconds) });
+            if (stats.tokens) {
+                items.push({ l: 'In', v: formatTokens(stats.tokens.input) });
+                items.push({ l: 'Out', v: formatTokens(stats.tokens.output) });
+                if (stats.tokens.cache_read) items.push({ l: 'Cache', v: formatTokens(stats.tokens.cache_read) });
+            }
+            if (stats.tool_calls) {
+                const total = Object.values(stats.tool_calls).reduce((a, b) => a + b, 0);
+                if (total) items.push({ l: 'Tools', v: String(total) });
+            }
+            if (stats.cwd) {
+                const short = stats.cwd.replace(/^\/home\/[^/]+\//, '~/');
+                items.push({ l: 'CWD', v: short });
+            }
+            if (stats.gitBranch) items.push({ l: 'Branch', v: stats.gitBranch });
+
+            bar.innerHTML = items.map((item, i) => {
+                return (i > 0 ? '<div class="stats-bar-sep"></div>' : '') +
+                    '<div class="stats-bar-item"><span class="stats-bar-label">' + escapeHtml(item.l) +
+                    '</span><span class="stats-bar-value">' + escapeHtml(item.v) + '</span></div>';
+            }).join('');
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Conversation Rendering
+        // ═══════════════════════════════════════════════════════════════
+        function renderConversation(autoScroll = true) {
+            const viewer = document.getElementById('conversationViewer');
+            updateConversationBadge();
+
+            if (svEvents.length === 0) {
+                viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">No events in this session</div></div>';
+                return;
+            }
+
+            let html = '<button class="load-earlier-btn" onclick="loadEarlierEvents()">Load Earlier Messages</button>';
+
+            for (const ev of svEvents) {
+                html += renderEvent(ev);
+            }
+
+            viewer.innerHTML = html;
+
+            if (autoScroll && svAutoScroll) {
+                viewer.scrollTop = viewer.scrollHeight;
+            }
+        }
+
+        function renderEvent(ev) {
+            if (ev.type === 'user') {
+                // Tool results
+                if (ev.tool_results && ev.tool_results.length > 0) {
+                    return ev.tool_results.map(tr => renderToolResult(tr)).join('');
+                }
+                // Regular user message
+                if (ev.text && ev.userType === 'external') {
+                    return renderUserMessage(ev);
+                }
+                // System/hook user messages
+                if (ev.text && ev.userType !== 'external') {
+                    return renderHookMessage(ev);
+                }
+                return '';
+            }
+
+            if (ev.type === 'assistant') {
+                let out = '';
+                if (ev.text) out += renderAssistantMessage(ev);
+                if (ev.tool_uses) {
+                    out += ev.tool_uses.map(tu => renderToolUse(tu, ev.uuid)).join('');
+                }
+                return out;
+            }
+
+            if (ev.type === 'system') {
+                return renderSystemEvent(ev);
+            }
+
+            // Skip progress by default
+            return '';
+        }
+
+        function renderUserMessage(ev) {
+            return '<div class="msg-bubble msg-user">' +
+                '<div class="msg-label">USER</div>' +
+                '<div class="msg-text">' + escapeHtml(ev.text) + '</div>' +
+                (ev.truncated ? '<div style="color:var(--text-muted);font-size:0.65rem;margin-top:4px">[truncated]</div>' : '') +
+                '</div>';
+        }
+
+        function renderHookMessage(ev) {
+            return '<div class="msg-bubble msg-user" style="opacity:0.6;border-left-color:var(--text-muted)">' +
+                '<div class="msg-label" style="color:var(--text-muted)">' + escapeHtml(ev.userType || 'SYSTEM') + '</div>' +
+                '<div class="msg-text" style="font-size:0.7rem;color:var(--text-secondary)">' + escapeHtml((ev.text || '').slice(0, 500)) + '</div>' +
+                '</div>';
+        }
+
+        function renderAssistantMessage(ev) {
+            const modelTag = ev.model ? '<span class="msg-model-tag">' + escapeHtml(shortModel(ev.model)) + '</span>' : '';
+            return '<div class="msg-bubble msg-assistant">' +
+                '<div class="msg-label">ASSISTANT ' + modelTag + '</div>' +
+                '<div class="msg-text">' + escapeHtml(ev.text) + '</div>' +
+                '</div>';
+        }
+
+        function renderToolUse(tu, parentUuid) {
+            const icon = toolIcon(tu.name);
+            const cardId = 'tc-' + (tu.id || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+            return '<div class="tool-card" id="' + cardId + '">' +
+                '<div class="tool-card-header" onclick="toggleToolCard(\'' + cardId + '\')">' +
+                '<span class="tool-chevron">&#x25B6;</span>' +
+                '<span class="tool-icon use">' + icon + '</span>' +
+                '<span class="tool-name">' + escapeHtml(tu.name) + '</span>' +
+                '<span class="tool-name-label">CALL</span>' +
+                '</div>' +
+                '<div class="tool-card-body">' +
+                '<div class="tool-content-label">Input</div>' +
+                '<div class="tool-content">' + escapeHtml(tu.input) + '</div>' +
+                (tu.truncated ? '<button class="show-full-btn" onclick="showFullEvent(\'' + escapeHtml(parentUuid) + '\',this)">Show full input</button>' : '') +
+                '</div></div>';
+        }
+
+        function renderToolResult(tr) {
+            const isErr = tr.is_error;
+            const iconClass = isErr ? 'error' : 'result';
+            const icon = isErr ? '&#x2717;' : '&#x2713;';
+            const cardId = 'tr-' + (tr.tool_use_id || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16);
+            return '<div class="tool-card" id="' + cardId + '">' +
+                '<div class="tool-card-header" onclick="toggleToolCard(\'' + cardId + '\')">' +
+                '<span class="tool-chevron">&#x25B6;</span>' +
+                '<span class="tool-icon ' + iconClass + '">' + icon + '</span>' +
+                '<span class="tool-name">' + (isErr ? 'Error' : 'Result') + '</span>' +
+                '<span class="tool-name-label">RESULT</span>' +
+                '</div>' +
+                '<div class="tool-card-body">' +
+                '<div class="tool-content">' + escapeHtml(tr.content || '') + '</div>' +
+                (tr.truncated ? '<button class="show-full-btn" onclick="showFullResult(\'' + escapeHtml(tr.tool_use_id) + '\',this)">Show full result</button>' : '') +
+                '</div></div>';
+        }
+
+        function renderSystemEvent(ev) {
+            const label = ev.subtype || 'system';
+            return '<div class="sys-event"><span class="sys-event-badge">' + escapeHtml(label) + '</span></div>';
+        }
+
+        function toolIcon(name) {
+            if (!name) return '&#x2699;';
+            const n = name.toLowerCase();
+            if (n.includes('read') || n.includes('glob') || n.includes('grep')) return '&#x1F50D;';
+            if (n.includes('write') || n.includes('edit') || n.includes('replace')) return '&#x270F;';
+            if (n.includes('bash') || n.includes('shell') || n.includes('execute')) return '&#x25B6;';
+            if (n.includes('task')) return '&#x2611;';
+            if (n.includes('web') || n.includes('fetch')) return '&#x1F310;';
+            if (n.includes('ask') || n.includes('question')) return '&#x2753;';
+            return '&#x2699;';
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Tool Card Interactions
+        // ═══════════════════════════════════════════════════════════════
+        function toggleToolCard(id) {
+            const card = document.getElementById(id);
+            if (card) card.classList.toggle('open');
+        }
+
+        async function showFullEvent(uuid, btn) {
+            if (!svSelectedId || !uuid) return;
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+
+            try {
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/raw-event/' + uuid);
+                if (!res.ok) throw new Error('Not found');
+                const raw = await res.json();
+
+                // Find the content container (sibling of the button)
+                const body = btn.closest('.tool-card-body');
+                const contentEl = body.querySelector('.tool-content');
+
+                // Extract tool_use input from raw event
+                const msg = raw.message || {};
+                const content = msg.content || [];
+                for (const block of content) {
+                    if (block && block.type === 'tool_use') {
+                        contentEl.textContent = JSON.stringify(block.input, null, 2);
+                        break;
+                    }
+                }
+                btn.remove();
+            } catch (err) {
+                btn.textContent = 'Error - retry';
+                btn.disabled = false;
+            }
+        }
+
+        async function showFullResult(toolUseId, btn) {
+            if (!svSelectedId) return;
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+
+            // Find the user event that contains this tool_result
+            // We need to search through events for the matching tool_use_id
+            const ev = svEvents.find(e =>
+                e.type === 'user' && e.tool_results &&
+                e.tool_results.some(tr => tr.tool_use_id === toolUseId)
+            );
+
+            if (!ev || !ev.uuid) {
+                btn.textContent = 'Not found';
+                btn.disabled = false;
+                return;
+            }
+
+            try {
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/raw-event/' + ev.uuid);
+                if (!res.ok) throw new Error('Not found');
+                const raw = await res.json();
+
+                const body = btn.closest('.tool-card-body');
+                const contentEl = body.querySelector('.tool-content');
+
+                // Find the matching tool_result in the raw event
+                const msg = raw.message || {};
+                const content = msg.content || [];
+                for (const block of content) {
+                    if (block && block.type === 'tool_result' && block.tool_use_id === toolUseId) {
+                        let text = '';
+                        if (typeof block.content === 'string') {
+                            text = block.content;
+                        } else if (Array.isArray(block.content)) {
+                            text = block.content
+                                .filter(c => c && c.type === 'text')
+                                .map(c => c.text || '')
+                                .join('\n');
+                        }
+                        contentEl.textContent = text;
+                        break;
+                    }
+                }
+                btn.remove();
+            } catch (err) {
+                btn.textContent = 'Error - retry';
+                btn.disabled = false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Auto-scroll management
+        // ═══════════════════════════════════════════════════════════════
+        document.addEventListener('DOMContentLoaded', () => {
+            const viewer = document.getElementById('conversationViewer');
+            viewer.addEventListener('scroll', () => {
+                const nearBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 80;
+                svAutoScroll = nearBottom;
+            });
+        });
+
+        // ═══════════════════════════════════════════════════════════════
+        // Filter Event Listeners
+        // ═══════════════════════════════════════════════════════════════
+        document.getElementById('sessionSearch').addEventListener('input', () => {
+            clearTimeout(svSearchTimer);
+            svSearchTimer = setTimeout(fetchSessionList, 300);
+        });
+
+        document.getElementById('sessionProject').addEventListener('change', fetchSessionList);
+        document.getElementById('sessionStatus').addEventListener('change', fetchSessionList);
+        document.getElementById('sessionDateFrom').addEventListener('change', fetchSessionList);
+        document.getElementById('sessionDateTo').addEventListener('change', fetchSessionList);
+        document.getElementById('loadMoreSessions').addEventListener('click', loadMoreSessions);
+
+        // ═══════════════════════════════════════════════════════════════
+        // Initialize
+        // ═══════════════════════════════════════════════════════════════
+        async function init() {
+            try {
+                await fetchData();
+                startProcessPolling();
+            } catch (err) {
+                console.log('API unavailable, starting demo mode');
+                runDemoMode();
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>
