@@ -1202,6 +1202,34 @@
             color: var(--progress-color);
         }
 
+        .subagent-type-badge.openclaw-spawn {
+            background: rgba(255, 165, 2, 0.12);
+            color: var(--warn-color);
+        }
+
+        .subagent-item.ephemeral {
+            opacity: 0.85;
+        }
+
+        .subagent-item.ephemeral .subagent-slug {
+            font-style: italic;
+        }
+
+        .subagent-status-dot.error {
+            background: var(--error-color);
+            box-shadow: 0 0 4px var(--error-color);
+        }
+
+        .sa-ephemeral-tag {
+            font-size: 0.5rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            background: rgba(255, 165, 2, 0.08);
+            color: var(--warn-color);
+            border: 1px solid rgba(255, 165, 2, 0.2);
+            margin-left: 4px;
+        }
+
         .subagent-slug {
             flex: 1;
             overflow: hidden;
@@ -2350,6 +2378,11 @@
 
         async function pollNewEvents() {
             if (!svSelectedId) return;
+            // Don't poll for ephemeral subagents (no session file)
+            if (svViewingSubagent) {
+                const sa = svSubagents.find(s => s.id === svViewingSubagent);
+                if (sa && sa.ephemeral) return;
+            }
             const targetId = svViewingSubagent || svSelectedId;
             try {
                 const url = svLastEventUUID
@@ -2791,14 +2824,24 @@
 
             list.innerHTML = svSubagents.map(sa => {
                 const sel = sa.id === svViewingSubagent ? ' selected' : '';
+                const isEphemeral = sa.ephemeral === true;
                 const slug = escapeHtml(sa.slug || sa.id.slice(0, 20));
                 const type = escapeHtml(sa.agentType || 'task-agent');
                 const typeCls = type.replace(/[^a-zA-Z0-9_-]/g, '');
-                return '<div class="subagent-item' + sel + '" data-sa-id="' + escapeHtml(sa.id) + '">' +
-                    '<span class="subagent-status-dot ' + (sa.status === 'active' ? 'active' : 'completed') + '"></span>' +
+
+                // Status dot class
+                let dotCls = sa.status === 'active' ? 'active' : 'completed';
+                if (sa.status === 'error') dotCls = 'error';
+
+                // Meta: show timestamp or mtime
+                const meta = sa.timestamp ? sa.timestamp.slice(0, 10) : (sa.mtime ? timeAgo(sa.mtime) : '');
+
+                return '<div class="subagent-item' + sel + (isEphemeral ? ' ephemeral' : '') + '" data-sa-id="' + escapeHtml(sa.id) + '">' +
+                    '<span class="subagent-status-dot ' + dotCls + '"></span>' +
                     '<span class="subagent-type-badge ' + typeCls + '">' + type + '</span>' +
                     '<span class="subagent-slug">' + slug + '</span>' +
-                    '<span class="subagent-meta">' + timeAgo(sa.mtime) + '</span>' +
+                    (isEphemeral ? '<span class="sa-ephemeral-tag">inline</span>' : '') +
+                    '<span class="subagent-meta">' + escapeHtml(meta) + '</span>' +
                     '</div>';
             }).join('');
 
@@ -2814,6 +2857,14 @@
         }
 
         async function viewSubagent(subagentId) {
+            const sa = svSubagents.find(s => s.id === subagentId);
+
+            // Handle ephemeral subagents (OpenClaw sessions_spawn)
+            if (sa && sa.ephemeral) {
+                viewEphemeralSubagent(sa);
+                return;
+            }
+
             svViewingSubagent = subagentId;
             svParentId = svSelectedId;
             svEvents = [];
@@ -2828,7 +2879,6 @@
             // Show back button
             document.getElementById('backToParentBtn').style.display = '';
 
-            const sa = svSubagents.find(s => s.id === subagentId);
             const saLabel = sa ? (sa.agentType + ': ' + (sa.slug || sa.id.slice(0, 12))) : subagentId.slice(0, 16);
             document.getElementById('conversationTitle').innerHTML = '&#x2B21; ' + escapeHtml(saLabel);
 
@@ -2859,6 +2909,81 @@
                 console.error('Subagent load error:', err);
                 viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">Error loading subagent</div></div>';
             }
+        }
+
+        function viewEphemeralSubagent(sa) {
+            // Show info panel for ephemeral OpenClaw subagents
+            svViewingSubagent = sa.id;
+            svParentId = svSelectedId;
+            svEvents = [];
+            svLastEventUUID = null;
+
+            document.querySelectorAll('.subagent-item').forEach(el => {
+                el.classList.toggle('selected', el.dataset.saId === sa.id);
+            });
+
+            document.getElementById('backToParentBtn').style.display = '';
+            document.getElementById('conversationTitle').innerHTML = '&#x2B21; ' + escapeHtml(sa.slug || sa.id);
+
+            const statusColor = sa.spawnStatus === 'accepted' ? 'var(--phosphor-green)' :
+                                sa.spawnStatus === 'error' ? 'var(--error-color)' : 'var(--warn-color)';
+            const statusIcon = sa.spawnStatus === 'accepted' ? '&#x2713;' : sa.spawnStatus === 'error' ? '&#x2717;' : '?';
+
+            let html = '<div style="padding: 24px; max-width: 600px; margin: 0 auto;">';
+            html += '<div style="border: 1px solid rgba(255,165,2,0.3); border-radius: 8px; padding: 16px; background: rgba(255,165,2,0.04);">';
+            html += '<div style="font-size: 0.7rem; color: var(--warn-color); margin-bottom: 12px; font-family: Orbitron, monospace; letter-spacing: 1px;">OPENCLAW SPAWNED SUBAGENT</div>';
+
+            // Status
+            html += '<div style="margin-bottom: 10px;">';
+            html += '<span style="color: var(--text-muted); font-size: 0.65rem;">STATUS: </span>';
+            html += '<span style="color:' + statusColor + '; font-weight: bold;">' + statusIcon + ' ' + escapeHtml(sa.spawnStatus || 'unknown').toUpperCase() + '</span>';
+            html += '</div>';
+
+            // Task/prompt
+            if (sa.slug) {
+                html += '<div style="margin-bottom: 10px;">';
+                html += '<div style="color: var(--text-muted); font-size: 0.65rem; margin-bottom: 4px;">TASK:</div>';
+                html += '<div style="color: var(--text-primary); font-size: 0.7rem; padding: 8px; background: var(--bg-secondary); border-radius: 4px; white-space: pre-wrap;">' + escapeHtml(sa.slug) + '</div>';
+                html += '</div>';
+            }
+
+            // Model
+            if (sa.model) {
+                html += '<div style="margin-bottom: 10px;">';
+                html += '<span style="color: var(--text-muted); font-size: 0.65rem;">MODEL: </span>';
+                html += '<span style="color: var(--progress-color);">' + escapeHtml(sa.model) + '</span>';
+                html += '</div>';
+            }
+
+            // Error message
+            if (sa.error) {
+                html += '<div style="margin-bottom: 10px;">';
+                html += '<div style="color: var(--text-muted); font-size: 0.65rem; margin-bottom: 4px;">ERROR:</div>';
+                html += '<div style="color: var(--error-color); font-size: 0.7rem; padding: 8px; background: rgba(220,38,38,0.05); border: 1px solid rgba(220,38,38,0.2); border-radius: 4px;">' + escapeHtml(sa.error) + '</div>';
+                html += '</div>';
+            }
+
+            // Run ID / Child Session Key
+            if (sa.childSessionKey) {
+                html += '<div style="margin-bottom: 10px;">';
+                html += '<span style="color: var(--text-muted); font-size: 0.6rem;">SESSION KEY: </span>';
+                html += '<span style="color: var(--text-muted); font-size: 0.6rem; font-family: JetBrains Mono, monospace;">' + escapeHtml(sa.childSessionKey) + '</span>';
+                html += '</div>';
+            }
+
+            // Explanation
+            html += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.05); color: var(--text-muted); font-size: 0.6rem; line-height: 1.5;">';
+            html += 'OpenClaw subagent sessions are ephemeral &mdash; their output is delivered inline in the parent conversation. ';
+            html += 'Use the <b>Back to parent</b> button to see the full conversation including subagent results.';
+            html += '</div>';
+
+            html += '</div></div>';
+
+            const viewer = document.getElementById('conversationViewer');
+            viewer.innerHTML = html;
+
+            // Clear stats bar
+            renderStatsBar({ model: sa.model || '', tokens: { input: 0, output: 0, cache_read: 0, cache_creation: 0 }, tool_calls: {}, duration_seconds: 0 });
         }
 
         function backToParentSession() {

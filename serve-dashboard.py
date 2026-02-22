@@ -139,7 +139,7 @@ class SessionIndex:
             age = time.time() - mtime
             active = age < 120 and not meta.get('has_stop', False)
 
-            # Scan subagents for this session
+            # Scan subagents for this session (on-disk)
             sub_dir = sess_dir / sid / 'subagents'
             sub_list = []
             if sub_dir.is_dir():
@@ -153,6 +153,9 @@ class SessionIndex:
             if sub_list:
                 subagents[sid] = sub_list
 
+            # Count inline subagents (OpenClaw sessions_spawn)
+            inline_count = meta.get('inline_subagent_count', 0)
+
             sessions[sid] = {
                 'sessionId': sid,
                 'project': display,
@@ -165,7 +168,7 @@ class SessionIndex:
                 'eventCount': meta.get('event_count', 0),
                 'cwd': meta.get('cwd', ''),
                 'gitBranch': meta.get('gitBranch', ''),
-                'subagentCount': len(sub_list),
+                'subagentCount': len(sub_list) + inline_count,
                 '_path': str(jsonl_file),
             }
 
@@ -258,6 +261,19 @@ class SessionIndex:
 
         except OSError:
             return None
+
+        # Lightweight count of inline subagents (accepted sessions_spawn only)
+        if meta.get('_openclaw'):
+            try:
+                count = 0
+                with open(path, 'r', errors='replace') as f:
+                    for line in f:
+                        if 'sessions_spawn' in line and '"accepted"' in line:
+                            count += 1
+                if count:
+                    meta['inline_subagent_count'] = count
+            except OSError:
+                pass
 
         return meta
 
@@ -709,6 +725,112 @@ class SessionEventReader:
 
         return result
 
+    # ── inline subagent scanning (OpenClaw sessions_spawn) ──────────────
+
+    @staticmethod
+    def scan_inline_subagents(path):
+        """Parse sessions_spawn tool calls to find ephemeral subagents.
+
+        OpenClaw subagents are spawned via the sessions_spawn tool and don't
+        persist as separate JSONL files. We extract their metadata from
+        the parent session's event stream.
+        """
+        calls = {}   # toolCallId -> {task, model, timestamp}
+        results = {} # toolCallId -> {status, childSessionKey, runId, error}
+
+        try:
+            with open(path, 'r', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or 'sessions_spawn' not in line:
+                        continue
+                    try:
+                        raw = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg = raw.get('message', {})
+                    role = msg.get('role', '')
+                    content = msg.get('content', [])
+                    ts = raw.get('timestamp', '')
+
+                    # Assistant message with toolCall blocks
+                    if isinstance(content, list):
+                        for block in content:
+                            if (isinstance(block, dict)
+                                    and block.get('type') == 'toolCall'
+                                    and block.get('name') == 'sessions_spawn'):
+                                cid = block.get('id', '')
+                                args = block.get('arguments', {})
+                                calls[cid] = {
+                                    'task': args.get('task', ''),
+                                    'model': args.get('model', ''),
+                                    'mode': args.get('mode', 'run'),
+                                    'timestamp': ts,
+                                }
+
+                    # toolResult role
+                    if role == 'toolResult' and msg.get('toolName') == 'sessions_spawn':
+                        tcid = msg.get('toolCallId', '')
+                        rc = ''
+                        if isinstance(content, list):
+                            for b in content:
+                                if isinstance(b, dict) and b.get('type') == 'text':
+                                    rc = b.get('text', '')
+                                    break
+                        elif isinstance(content, str):
+                            rc = content
+                        if rc:
+                            try:
+                                parsed = json.loads(rc)
+                                results[tcid] = {
+                                    'status': parsed.get('status', ''),
+                                    'childSessionKey': parsed.get('childSessionKey', ''),
+                                    'runId': parsed.get('runId', ''),
+                                    'error': parsed.get('error', ''),
+                                }
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+
+        except OSError:
+            return []
+
+        # Build subagent list from paired calls + results (accepted only)
+        subagents = []
+        for tcid, result in results.items():
+            status = result.get('status', 'unknown')
+            if status != 'accepted':
+                continue  # skip failed spawn attempts
+
+            call = calls.get(tcid, {})
+            child_key = result.get('childSessionKey', '')
+            # Extract UUID from childSessionKey like "agent:tester:subagent:UUID"
+            parts = child_key.split(':')
+            sa_id = parts[-1] if len(parts) >= 4 else child_key
+
+            task = call.get('task', '')
+            # Use first 60 chars of task as slug
+            slug = task[:60].replace('\n', ' ').strip()
+            if len(task) > 60:
+                slug += '...'
+
+            subagents.append({
+                'id': 'oc-spawn-' + sa_id[:12],
+                'parentId': '',  # filled by caller
+                'agentType': 'openclaw-spawn',
+                'slug': slug,
+                'model': call.get('model', ''),
+                'status': 'completed',
+                'ephemeral': True,
+                'spawnStatus': status,
+                'runId': result.get('runId', ''),
+                'childSessionKey': child_key,
+                'timestamp': call.get('timestamp', ''),
+                'mtime': 0,  # no file mtime
+            })
+
+        return subagents
+
     # ── raw event & stats ─────────────────────────────────────────────────
 
     @staticmethod
@@ -989,6 +1111,15 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
     def handle_session_subagents(self, session_id):
         try:
             subagents = session_index.get_subagents(session_id)
+
+            # Also scan for inline (ephemeral) subagents from sessions_spawn
+            path = session_index.get_session_path(session_id)
+            if path:
+                inline = SessionEventReader.scan_inline_subagents(path)
+                for sa in inline:
+                    sa['parentId'] = session_id
+                subagents = subagents + inline
+
             self.send_json({
                 'sessionId': session_id,
                 'subagents': subagents,
