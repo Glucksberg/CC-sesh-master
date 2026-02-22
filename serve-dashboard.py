@@ -25,6 +25,7 @@ CLAUDE_DIR = Path.home() / '.claude'
 PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
+CODEX_DIR = Path.home() / '.codex' / 'sessions'
 
 # Allowed origins for CORS (localhost only)
 ALLOWED_ORIGINS = {'http://localhost:37778', 'http://127.0.0.1:37778', 'null'}
@@ -86,7 +87,7 @@ class SessionIndex:
 
                 self._scan_session_dir(
                     proj_dir, display, sessions, subagents,
-                    subagent_paths, projects,
+                    subagent_paths, projects, source='claude',
                 )
 
         # ── Scan ~/.openclaw/agents/*/sessions/ ──────────────────────
@@ -100,8 +101,12 @@ class SessionIndex:
                 display = 'openclaw/' + agent_dir.name
                 self._scan_session_dir(
                     sess_dir, display, sessions, subagents,
-                    subagent_paths, projects,
+                    subagent_paths, projects, source='openclaw',
                 )
+
+        # ── Scan ~/.codex/sessions/ ──────────────────────────────────
+        if CODEX_DIR.exists():
+            self._scan_codex_sessions(CODEX_DIR, sessions, projects)
 
         with self._lock:
             self._sessions = sessions
@@ -111,7 +116,7 @@ class SessionIndex:
             self._last_rebuild = time.time()
 
     def _scan_session_dir(self, sess_dir, display, sessions, subagents,
-                          subagent_paths, projects):
+                          subagent_paths, projects, source='claude'):
         """Scan a directory for UUID-named .jsonl session files."""
         for jsonl_file in sess_dir.glob('*.jsonl'):
             sid = jsonl_file.stem
@@ -159,6 +164,7 @@ class SessionIndex:
             sessions[sid] = {
                 'sessionId': sid,
                 'project': display,
+                'source': source,
                 'slug': meta.get('slug', ''),
                 'status': 'active' if active else 'completed',
                 'model': meta.get('model', ''),
@@ -337,17 +343,159 @@ class SessionIndex:
 
         return info
 
+    # ── Codex session scanning ─────────────────────────────────────────────
+
+    def _scan_codex_sessions(self, base_dir, sessions, projects):
+        """Scan ~/.codex/sessions/ for rollout-*.jsonl files."""
+        for jsonl_file in base_dir.rglob('rollout-*.jsonl'):
+            try:
+                st = jsonl_file.stat()
+                mtime = st.st_mtime
+                size = st.st_size
+            except OSError:
+                continue
+            if size == 0:
+                continue
+
+            meta = self._extract_codex_metadata(jsonl_file, size)
+            if meta is None:
+                continue
+
+            sid = 'codex-' + meta.get('id', jsonl_file.stem)
+            cwd = meta.get('cwd', '')
+            # Project display: codex/ + relative cwd
+            home_prefix = str(Path.home()) + '/'
+            rel = cwd.replace(home_prefix, '').rstrip('/') if cwd else ''
+            display = 'codex/' + rel if rel else 'codex'
+            projects.add(display)
+
+            age = time.time() - mtime
+            active = age < 120 and not meta.get('has_complete', False)
+
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'codex',
+                'slug': meta.get('slug', ''),
+                'status': 'active' if active else 'completed',
+                'model': meta.get('model', ''),
+                'version': meta.get('version', ''),
+                'mtime': mtime,
+                'size': size,
+                'eventCount': meta.get('event_count', 0),
+                'cwd': cwd,
+                'gitBranch': meta.get('gitBranch', ''),
+                'subagentCount': 0,
+                '_path': str(jsonl_file),
+            }
+
+    @staticmethod
+    def _extract_codex_metadata(path, size):
+        meta = {'event_count': max(1, size // 500)}
+        try:
+            with open(path, 'r', errors='replace') as f:
+                # Read first ~30 lines for session_meta, turn_context, first user msg
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        t = obj.get('type', '')
+                        payload = obj.get('payload', {})
+                        if not isinstance(payload, dict):
+                            continue
+
+                        if t == 'session_meta':
+                            meta['id'] = payload.get('id', '')
+                            meta['cwd'] = payload.get('cwd', '')
+                            meta['version'] = payload.get('cli_version', '')
+                            git = payload.get('git', {})
+                            if isinstance(git, dict):
+                                meta['gitBranch'] = git.get('branch', '')
+
+                        elif t == 'turn_context':
+                            if not meta.get('model'):
+                                meta['model'] = payload.get('model', '')
+
+                        elif t == 'event_msg':
+                            pt = payload.get('type', '')
+                            # event_msg/user_message has the actual user-typed text
+                            if pt == 'user_message' and not meta.get('slug'):
+                                text = payload.get('message', '').strip()
+                                if text:
+                                    meta['slug'] = text[:80].replace('\n', ' ').strip()
+
+                        elif t == 'response_item':
+                            pt = payload.get('type', '')
+                            # Fallback: use first real user message as slug
+                            if pt == 'message' and payload.get('role') == 'user':
+                                if not meta.get('slug'):
+                                    content = payload.get('content', [])
+                                    if isinstance(content, list):
+                                        for block in content:
+                                            if isinstance(block, dict) and block.get('type') == 'input_text':
+                                                text = block.get('text', '').strip()
+                                                # Skip system/developer injected content
+                                                if (text.startswith('#') or text.startswith('<')
+                                                        or len(text) > 500 or not text):
+                                                    continue
+                                                meta['slug'] = text[:80].replace('\n', ' ').strip()
+                                                break
+
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                # Tail read for task_complete and model
+                seek_back = min(size, 4096)
+                f.seek(max(0, size - seek_back))
+                if size > seek_back:
+                    f.readline()
+                tail = f.read()
+
+                for line in reversed(tail.strip().split('\n')):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        t = obj.get('type', '')
+                        payload = obj.get('payload', {})
+                        if not isinstance(payload, dict):
+                            continue
+                        if t == 'event_msg' and payload.get('type') == 'task_complete':
+                            meta['has_complete'] = True
+                        if not meta.get('model') and t == 'turn_context':
+                            meta['model'] = payload.get('model', '')
+                        if meta.get('has_complete') and meta.get('model'):
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+        except OSError:
+            return None
+
+        return meta
+
     # ── query interface ───────────────────────────────────────────────────
 
     def get_sessions(self, project=None, status=None, search=None,
                      date_from=None, date_to=None, sort='mtime',
-                     offset=0, limit=50):
+                     offset=0, limit=50, source=None):
         self.ensure_fresh()
 
         with self._lock:
             sessions = list(self._sessions.values())
             all_projects = sorted(self._projects)
 
+        # Collect available sources
+        sources = sorted(set(s.get('source', 'claude') for s in sessions))
+
+        if source and source in ('claude', 'openclaw', 'codex'):
+            sessions = [s for s in sessions if s.get('source') == source]
         if project:
             sessions = [s for s in sessions if s['project'] == project]
         if status and status != 'all':
@@ -379,7 +527,8 @@ class SessionIndex:
 
         return {
             'sessions': result, 'total': total,
-            'projects': all_projects, 'offset': offset, 'limit': limit,
+            'projects': all_projects, 'sources': sources,
+            'offset': offset, 'limit': limit,
         }
 
     def get_session_path(self, session_id):
@@ -426,13 +575,24 @@ class SessionEventReader:
         'session', 'thinking_level_change', 'custom',
     ])
 
+    _CODEX_TYPES = frozenset([
+        'session_meta', 'response_item', 'event_msg', 'turn_context',
+    ])
+
+    @staticmethod
+    def _is_codex_path(path):
+        """Check if path is under the Codex sessions directory."""
+        return str(path).startswith(str(CODEX_DIR))
+
     @classmethod
     def read_events(cls, path, after=None, limit=100, types=None):
         events = []
         try:
             file_size = os.path.getsize(path)
 
-            if after:
+            if cls._is_codex_path(path):
+                events = cls._read_codex_events(path, file_size, after, limit, types)
+            elif after:
                 events = cls._read_after_cursor(path, file_size, after, limit, types)
             else:
                 events = cls._read_tail(path, file_size, limit, types)
@@ -518,6 +678,268 @@ class SessionEventReader:
                     if not types or ev['type'] in types:
                         events.append(ev)
         return events[-limit:]
+
+    # ── Codex event reading ────────────────────────────────────────────────
+
+    @classmethod
+    def _read_codex_events(cls, path, file_size, after=None, limit=100, types=None):
+        """Read events from a Codex JSONL file using line-number cursors."""
+        events = []
+
+        # Parse after cursor: "codex-<line_num>"
+        if after and after.startswith('codex-'):
+            try:
+                after_line = int(after.split('-', 1)[1])
+            except (ValueError, IndexError):
+                after_line = -1
+
+            # Cursor-based: scan from beginning to find the line
+            found = False
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if not found:
+                        if line_num == after_line:
+                            found = True
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                        if len(events) >= limit:
+                            break
+            return events
+
+        # Initial load (no cursor): use tail-read for large files
+        if file_size > TAIL_READ_BYTES:
+            # Count total lines first to get correct line numbers
+            with open(path, 'r', errors='replace') as f:
+                f.seek(max(0, file_size - TAIL_READ_BYTES))
+                f.readline()  # discard partial
+                start_offset = f.tell()
+                # Count lines before this offset
+                f.seek(0)
+                line_offset = 0
+                while f.tell() < start_offset:
+                    f.readline()
+                    line_offset += 1
+                # Now read from offset with correct line numbers
+                f.seek(start_offset)
+                for rel_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_offset + rel_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+            return events[-limit:]
+
+        # Small files: full scan
+        with open(path, 'r', errors='replace') as f:
+            for line_num, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                ev = cls._parse_codex_event(line, line_num)
+                if ev and ev['type'] not in cls._SKIP_TYPES:
+                    if not types or ev['type'] in types:
+                        events.append(ev)
+        return events[-limit:]
+
+    @staticmethod
+    def _parse_codex_event(line, line_num=0):
+        """Parse a Codex JSONL line into the unified event format."""
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        t = raw.get('type', '')
+        payload = raw.get('payload', {})
+        if not isinstance(payload, dict):
+            return None
+        pt = payload.get('type', '')
+        ts = raw.get('timestamp', '')
+        uuid = f'codex-{line_num}'
+
+        # Skip non-display events
+        if t == 'session_meta' or t == 'turn_context':
+            return None
+        if t == 'event_msg' and pt in ('token_count', 'agent_reasoning',
+                                        'agent_message', 'user_message',
+                                        'context_compacted'):
+            return None
+
+        # ── event_msg: task_started / task_complete → system ─────────
+        if t == 'event_msg':
+            if pt in ('task_started', 'task_complete'):
+                return {
+                    'type': 'system',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'subtype': pt,
+                    'level': '',
+                }
+            return None
+
+        # ── response_item ────────────────────────────────────────────
+        if t == 'response_item':
+            role = payload.get('role', '')
+            content = payload.get('content', [])
+
+            # User message
+            if pt == 'message' and role == 'user':
+                texts = []
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get('type') == 'input_text':
+                            texts.append(block.get('text', '')[:MAX_TEXT_LEN])
+                # Skip system-injected context
+                if texts and (texts[0].startswith('# AGENTS.md')
+                              or texts[0].startswith('# Collaboration Mode')
+                              or texts[0].startswith('<environment_context>')):
+                    return None
+                if not texts:
+                    return None
+                joined = '\n'.join(texts)
+                return {
+                    'type': 'user',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'userType': 'external',
+                    'text': joined[:MAX_TEXT_LEN],
+                    'truncated': len(joined) > MAX_TEXT_LEN,
+                }
+
+            # Developer message (system instructions) — skip
+            if pt == 'message' and role == 'developer':
+                return None
+
+            # Assistant message
+            if pt == 'message' and role == 'assistant':
+                texts = []
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get('type') == 'output_text':
+                            texts.append(block.get('text', '')[:MAX_TEXT_LEN])
+                result = {
+                    'type': 'assistant',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                }
+                if texts:
+                    result['text'] = '\n'.join(texts)
+                return result
+
+            # Function call
+            if pt == 'function_call':
+                name = payload.get('name', '')
+                args = payload.get('arguments', '{}')
+                if isinstance(args, str) and len(args) > MAX_TOOL_INPUT_LEN:
+                    truncated = True
+                    args = args[:MAX_TOOL_INPUT_LEN]
+                else:
+                    truncated = False
+                return {
+                    'type': 'assistant',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                    'tool_uses': [{
+                        'type': 'tool_use',
+                        'id': payload.get('call_id', ''),
+                        'name': name,
+                        'input': args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)[:MAX_TOOL_INPUT_LEN],
+                        'truncated': truncated,
+                    }],
+                }
+
+            # Function call output
+            if pt == 'function_call_output':
+                output = payload.get('output', '')
+                return {
+                    'type': 'user',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'userType': 'tool_result',
+                    'tool_results': [{
+                        'tool_use_id': payload.get('call_id', ''),
+                        'type': 'tool_result',
+                        'content': output[:MAX_TOOL_RESULT_LEN],
+                        'truncated': len(output) > MAX_TOOL_RESULT_LEN,
+                    }],
+                }
+
+            # Custom tool call (apply_patch etc)
+            if pt == 'custom_tool_call':
+                inp = payload.get('input', '')
+                if isinstance(inp, str) and len(inp) > MAX_TOOL_INPUT_LEN:
+                    truncated = True
+                    inp = inp[:MAX_TOOL_INPUT_LEN]
+                else:
+                    truncated = False
+                return {
+                    'type': 'assistant',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                    'tool_uses': [{
+                        'type': 'tool_use',
+                        'id': payload.get('call_id', ''),
+                        'name': payload.get('name', ''),
+                        'input': inp,
+                        'truncated': truncated,
+                    }],
+                }
+
+            # Custom tool call output
+            if pt == 'custom_tool_call_output':
+                output = payload.get('output', '')
+                return {
+                    'type': 'user',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'userType': 'tool_result',
+                    'tool_results': [{
+                        'tool_use_id': payload.get('call_id', ''),
+                        'type': 'tool_result',
+                        'content': output[:MAX_TOOL_RESULT_LEN],
+                        'truncated': len(output) > MAX_TOOL_RESULT_LEN,
+                    }],
+                }
+
+            # Reasoning
+            if pt == 'reasoning':
+                summary = payload.get('summary', [])
+                summary_text = ''
+                if isinstance(summary, list):
+                    parts = [item.get('text', '') for item in summary
+                             if isinstance(item, dict) and item.get('type') == 'summary_text']
+                    summary_text = '\n'.join(parts)
+                result = {
+                    'type': 'assistant',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                    'hasThinking': True,
+                }
+                if summary_text:
+                    result['text'] = summary_text[:MAX_TEXT_LEN]
+                return result
+
+        return None
 
     # ── single-event parsing ──────────────────────────────────────────────
 
@@ -836,6 +1258,18 @@ class SessionEventReader:
     @staticmethod
     def get_raw_event(path, event_uuid):
         try:
+            # Codex: line-number based lookup
+            if event_uuid.startswith('codex-'):
+                try:
+                    target_line = int(event_uuid.split('-', 1)[1])
+                except (ValueError, IndexError):
+                    return None
+                with open(path, 'r', errors='replace') as f:
+                    for i, line in enumerate(f):
+                        if i == target_line:
+                            return json.loads(line.strip())
+                return None
+
             size = os.path.getsize(path)
             # Try tail first
             if size > TAIL_READ_BYTES:
@@ -958,6 +1392,53 @@ class SessionEventReader:
                                     stats['tool_calls'][name] = (
                                         stats['tool_calls'].get(name, 0) + 1
                                     )
+
+                    # Codex format
+                    elif et in ('session_meta', 'turn_context',
+                                'response_item', 'event_msg'):
+                        payload = raw.get('payload', {})
+                        if not isinstance(payload, dict):
+                            continue
+                        pt = payload.get('type', '')
+
+                        if et == 'session_meta':
+                            if not stats['cwd']:
+                                stats['cwd'] = payload.get('cwd', '')
+                            if not stats['version']:
+                                stats['version'] = payload.get('cli_version', '')
+                            git = payload.get('git', {})
+                            if isinstance(git, dict) and not stats['gitBranch']:
+                                stats['gitBranch'] = git.get('branch', '')
+
+                        elif et == 'turn_context':
+                            if not stats['model']:
+                                stats['model'] = payload.get('model', '')
+                            if not stats['cwd']:
+                                stats['cwd'] = payload.get('cwd', '')
+
+                        elif et == 'event_msg' and pt == 'token_count':
+                            info = payload.get('info')
+                            if isinstance(info, dict):
+                                usage = info.get('total_token_usage', {})
+                                if isinstance(usage, dict):
+                                    # Cumulative — overwrite with latest
+                                    inp = usage.get('input_tokens', 0)
+                                    out = usage.get('output_tokens', 0)
+                                    cached = usage.get('cached_input_tokens', 0)
+                                    reasoning = usage.get('reasoning_output_tokens', 0)
+                                    if inp:
+                                        stats['tokens']['input'] = inp
+                                    if out:
+                                        stats['tokens']['output'] = out + reasoning
+                                    if cached:
+                                        stats['tokens']['cache_read'] = cached
+
+                        elif et == 'response_item':
+                            if pt in ('function_call', 'custom_tool_call'):
+                                name = payload.get('name', 'unknown')
+                                stats['tool_calls'][name] = (
+                                    stats['tool_calls'].get(name, 0) + 1
+                                )
         except OSError as e:
             print(f"Error reading stats: {e}", file=sys.stderr)
 
@@ -1073,6 +1554,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 sort=qs.get('sort', ['mtime'])[0],
                 offset=int(qs.get('offset', ['0'])[0]),
                 limit=min(int(qs.get('limit', ['50'])[0]), 200),
+                source=qs.get('source', [None])[0],
             )
             self.send_json(data)
         except Exception as e:

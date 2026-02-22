@@ -938,6 +938,21 @@
             color: var(--mem-color);
         }
 
+        .session-badge.source-claude {
+            background: rgba(0, 255, 136, 0.12);
+            color: var(--phosphor-dim);
+        }
+
+        .session-badge.source-openclaw {
+            background: rgba(6, 182, 212, 0.15);
+            color: var(--progress-color);
+        }
+
+        .session-badge.source-codex {
+            background: rgba(255, 165, 2, 0.15);
+            color: var(--anomaly-color);
+        }
+
         .session-status-dot {
             width: 6px;
             height: 6px;
@@ -1732,6 +1747,14 @@
                                 </select>
                             </div>
                             <div class="filter-row">
+                                <select class="filter-select" id="sessionSource">
+                                    <option value="">All Sources</option>
+                                    <option value="claude">Claude Code</option>
+                                    <option value="openclaw">OpenClaw</option>
+                                    <option value="codex">Codex CLI</option>
+                                </select>
+                            </div>
+                            <div class="filter-row">
                                 <input type="date" class="filter-date" id="sessionDateFrom" title="From date">
                                 <input type="date" class="filter-date" id="sessionDateTo" title="To date">
                             </div>
@@ -1912,6 +1935,8 @@
                 const ver = match[3] ? match[2] + '.' + match[3] : match[2];
                 return name + '-' + ver;
             }
+            // gpt-5.3-codex -> gpt-5.3-codex (already short)
+            if (m.startsWith('gpt-') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return m;
             return m.split('-').slice(-2).join('-');
         }
 
@@ -2208,12 +2233,14 @@
             const search = document.getElementById('sessionSearch').value;
             const project = document.getElementById('sessionProject').value;
             const status = document.getElementById('sessionStatus').value;
+            const source = document.getElementById('sessionSource').value;
             const dateFrom = document.getElementById('sessionDateFrom').value;
             const dateTo = document.getElementById('sessionDateTo').value;
 
             if (search) params.set('search', search);
             if (project) params.set('project', project);
             if (status) params.set('status', status);
+            if (source) params.set('source', source);
             if (dateFrom) params.set('date_from', dateFrom);
             if (dateTo) params.set('date_to', dateTo);
             params.set('offset', '0');
@@ -2258,10 +2285,13 @@
                     const slug = escapeHtml(s.slug || s.sessionId.slice(0, 8));
                     const proj = escapeHtml(s.project || '');
                     const model = shortModel(s.model);
+                    const src = s.source || 'claude';
+                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex'}[src] || src;
                     return '<div class="session-item' + sel + active + '" data-id="' + escapeHtml(s.sessionId) + '" onclick="selectSession(\'' + escapeHtml(s.sessionId) + '\')">' +
                         '<div class="session-slug">' + slug + '</div>' +
                         '<div class="session-meta">' +
                         '<span class="session-status-dot ' + (s.status === 'active' ? 'active' : 'completed') + '"></span>' +
+                        '<span class="session-badge source-' + src + '">' + srcLabel + '</span>' +
                         (proj ? '<span class="session-badge project">' + proj + '</span>' : '') +
                         (model ? '<span class="session-badge model">' + escapeHtml(model) + '</span>' : '') +
                         (s.subagentCount ? '<span class="session-badge subagents">' + s.subagentCount + ' sub</span>' : '') +
@@ -2285,9 +2315,11 @@
             const search = document.getElementById('sessionSearch').value;
             const project = document.getElementById('sessionProject').value;
             const status = document.getElementById('sessionStatus').value;
+            const source = document.getElementById('sessionSource').value;
             if (search) params.set('search', search);
             if (project) params.set('project', project);
             if (status) params.set('status', status);
+            if (source) params.set('source', source);
             params.set('offset', String(svOffset));
             params.set('limit', '50');
 
@@ -2707,10 +2739,10 @@
             if (!name) return '&#x2699;';
             const n = name.toLowerCase();
             if (n.includes('read') || n.includes('glob') || n.includes('grep')) return '&#x1F50D;';
-            if (n.includes('write') || n.includes('edit') || n.includes('replace')) return '&#x270F;';
-            if (n.includes('bash') || n.includes('shell') || n.includes('execute')) return '&#x25B6;';
+            if (n.includes('write') || n.includes('edit') || n.includes('replace') || n === 'apply_patch') return '&#x270F;';
+            if (n.includes('bash') || n.includes('shell') || n.includes('execute') || n === 'exec_command') return '&#x25B6;';
             if (n.includes('task')) return '&#x2611;';
-            if (n.includes('web') || n.includes('fetch')) return '&#x1F310;';
+            if (n.includes('web') || n.includes('fetch') || n === 'web_search') return '&#x1F310;';
             if (n.includes('ask') || n.includes('question')) return '&#x2753;';
             return '&#x2699;';
         }
@@ -3018,6 +3050,7 @@
 
         document.getElementById('sessionProject').addEventListener('change', fetchSessionList);
         document.getElementById('sessionStatus').addEventListener('change', fetchSessionList);
+        document.getElementById('sessionSource').addEventListener('change', fetchSessionList);
         document.getElementById('sessionDateFrom').addEventListener('change', fetchSessionList);
         document.getElementById('sessionDateTo').addEventListener('change', fetchSessionList);
         document.getElementById('loadMoreSessions').addEventListener('click', loadMoreSessions);
