@@ -1094,6 +1094,164 @@
             box-shadow: none;
         }
 
+        /* Subagent badge on session items */
+        .session-badge.subagents {
+            background: rgba(255, 165, 2, 0.15);
+            color: var(--anomaly-color);
+        }
+
+        /* Subagent bar */
+        .subagent-bar {
+            display: none;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 2px;
+            margin-bottom: 8px;
+            overflow: hidden;
+        }
+
+        .subagent-bar.visible {
+            display: block;
+        }
+
+        .subagent-bar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 14px;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .subagent-bar-header:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .subagent-bar-header .sa-title {
+            font-weight: 600;
+            color: var(--anomaly-color);
+            letter-spacing: 0.5px;
+        }
+
+        .subagent-bar-header .sa-count {
+            color: var(--text-muted);
+            font-size: 0.6rem;
+        }
+
+        .subagent-list {
+            display: none;
+            border-top: 1px solid var(--border-color);
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .subagent-bar.open .subagent-list {
+            display: block;
+        }
+
+        .subagent-list::-webkit-scrollbar { width: 4px; }
+        .subagent-list::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        .subagent-list::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 2px; }
+
+        .subagent-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            font-size: 0.7rem;
+            cursor: pointer;
+            transition: background 0.15s;
+            border-bottom: 1px solid rgba(45, 55, 72, 0.4);
+        }
+
+        .subagent-item:last-child { border-bottom: none; }
+
+        .subagent-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .subagent-item.selected {
+            background: rgba(255, 165, 2, 0.08);
+            border-left: 2px solid var(--anomaly-color);
+        }
+
+        .subagent-type-badge {
+            font-size: 0.55rem;
+            padding: 1px 5px;
+            border-radius: 2px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+
+        .subagent-type-badge.task-agent {
+            background: rgba(0, 255, 136, 0.12);
+            color: var(--phosphor-green);
+        }
+
+        .subagent-type-badge.prompt_suggestion {
+            background: rgba(168, 85, 247, 0.12);
+            color: var(--mem-color);
+        }
+
+        .subagent-type-badge.compact {
+            background: rgba(6, 182, 212, 0.12);
+            color: var(--progress-color);
+        }
+
+        .subagent-slug {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--text-primary);
+        }
+
+        .subagent-meta {
+            color: var(--text-muted);
+            font-size: 0.6rem;
+            white-space: nowrap;
+        }
+
+        .subagent-status-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .subagent-status-dot.active {
+            background: var(--phosphor-green);
+            box-shadow: 0 0 4px var(--phosphor-green);
+        }
+
+        .subagent-status-dot.completed {
+            background: var(--text-muted);
+        }
+
+        .back-to-parent-btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.6rem;
+            background: rgba(255, 165, 2, 0.08);
+            border: 1px solid rgba(255, 165, 2, 0.3);
+            color: var(--anomaly-color);
+            padding: 3px 10px;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+
+        .back-to-parent-btn:hover {
+            background: rgba(255, 165, 2, 0.15);
+            box-shadow: 0 0 6px rgba(255, 165, 2, 0.2);
+        }
+
         .load-earlier-btn {
             display: block;
             margin: 0 auto 16px;
@@ -1568,11 +1726,21 @@
                     <!-- Stats Bar (hidden until session selected) -->
                     <div class="stats-bar" id="sessionStatsBar" style="display:none"></div>
 
+                    <!-- Subagent Bar (hidden until session with subagents selected) -->
+                    <div class="subagent-bar" id="subagentBar">
+                        <div class="subagent-bar-header" onclick="toggleSubagentBar()">
+                            <span class="sa-title">&#x2B21; Subagents</span>
+                            <span class="sa-count" id="subagentCount"></span>
+                        </div>
+                        <div class="subagent-list" id="subagentList"></div>
+                    </div>
+
                     <!-- Conversation Panel -->
                     <div class="conversation-panel">
                         <div class="panel-header">
                             <span class="panel-title" id="conversationTitle">&#x25C8; Conversation</span>
                             <div style="display:flex;align-items:center;gap:8px">
+                                <button class="back-to-parent-btn" id="backToParentBtn" onclick="backToParentSession()" style="display:none">&#x25C0; Parent</button>
                                 <button class="export-btn" id="exportSessionBtn" onclick="exportSession()" style="display:none">&#x2B07; Export</button>
                                 <span class="panel-badge" id="conversationBadge">Select a session</span>
                             </div>
@@ -1656,6 +1824,9 @@
         let svTotal = 0;
         let svProjects = [];
         let svSearchTimer = null;
+        let svSubagents = [];        // subagents for current parent session
+        let svViewingSubagent = null; // subagent ID if viewing a subagent conversation
+        let svParentId = null;        // parent session ID when viewing subagent
 
         // ═══════════════════════════════════════════════════════════════
         // Helpers
@@ -2065,6 +2236,7 @@
                         '<span class="session-status-dot ' + (s.status === 'active' ? 'active' : 'completed') + '"></span>' +
                         (proj ? '<span class="session-badge project">' + proj + '</span>' : '') +
                         (model ? '<span class="session-badge model">' + escapeHtml(model) + '</span>' : '') +
+                        (s.subagentCount ? '<span class="session-badge subagents">' + s.subagentCount + ' sub</span>' : '') +
                         '<span class="session-time">' + timeAgo(s.mtime) + '</span>' +
                         '</div></div>';
                 }).join('');
@@ -2109,16 +2281,23 @@
         // Session Selection & Events
         // ═══════════════════════════════════════════════════════════════
         async function selectSession(id) {
-            if (svSelectedId === id) return;
+            if (svSelectedId === id && !svViewingSubagent) return;
             svSelectedId = id;
             svEvents = [];
             svLastEventUUID = null;
             svAutoScroll = true;
+            svViewingSubagent = null;
+            svParentId = null;
+            svSubagents = [];
 
             // Update selection in list
             document.querySelectorAll('.session-item').forEach(el => {
                 el.classList.toggle('selected', el.dataset.id === id);
             });
+
+            // Hide back button and subagent bar
+            document.getElementById('backToParentBtn').style.display = 'none';
+            document.getElementById('subagentBar').classList.remove('visible', 'open');
 
             // Show loading
             const viewer = document.getElementById('conversationViewer');
@@ -2129,10 +2308,17 @@
             document.getElementById('conversationTitle').innerHTML = '&#x25C8; ' + escapeHtml(session?.slug || id.slice(0, 8));
 
             try {
-                const [evRes, stRes] = await Promise.all([
+                const fetches = [
                     fetch(SESSION_API + '/' + id + '/events?limit=100'),
                     fetch(SESSION_API + '/' + id + '/stats'),
-                ]);
+                ];
+                // Also fetch subagents if this session has them
+                if (session && session.subagentCount > 0) {
+                    fetches.push(fetch(SESSION_API + '/' + id + '/subagents'));
+                }
+
+                const results = await Promise.all(fetches);
+                const [evRes, stRes] = results;
 
                 if (evRes.ok) {
                     const evData = await evRes.json();
@@ -2148,6 +2334,13 @@
                     renderStatsBar(stats);
                 }
 
+                // Handle subagents
+                if (results[2] && results[2].ok) {
+                    const saData = await results[2].json();
+                    svSubagents = saData.subagents || [];
+                    renderSubagentBar();
+                }
+
                 startEventPolling();
             } catch (err) {
                 console.error('Session load error:', err);
@@ -2156,9 +2349,13 @@
         }
 
         async function pollNewEvents() {
-            if (!svSelectedId || !svLastEventUUID) return;
+            if (!svSelectedId) return;
+            const targetId = svViewingSubagent || svSelectedId;
             try {
-                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?after=' + svLastEventUUID + '&limit=50');
+                const url = svLastEventUUID
+                    ? SESSION_API + '/' + targetId + '/events?after=' + svLastEventUUID + '&limit=50'
+                    : SESSION_API + '/' + targetId + '/events?limit=50';
+                const res = await fetch(url);
                 if (!res.ok) return;
                 const data = await res.json();
                 if (data.events && data.events.length > 0) {
@@ -2180,11 +2377,12 @@
 
         async function loadEarlierEvents() {
             if (!svSelectedId || svEvents.length === 0) return;
+            const targetId = svViewingSubagent || svSelectedId;
             const firstUUID = svEvents[0].uuid;
             // We need to fetch events before the first one
             // The API reads from the end, so we fetch more and filter
             try {
-                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?limit=200');
+                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=200');
                 if (!res.ok) return;
                 const data = await res.json();
                 const allEvents = data.events || [];
@@ -2209,23 +2407,33 @@
             const btn = document.getElementById('exportSessionBtn');
             btn.disabled = true;
             btn.textContent = 'Exporting...';
+            const targetId = svViewingSubagent || svSelectedId;
 
             try {
                 // Fetch all events (larger limit)
-                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?limit=5000');
+                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=5000');
                 if (!res.ok) throw new Error('Failed');
                 const data = await res.json();
                 const allEvents = data.events || [];
 
                 const session = svSessions.find(s => s.sessionId === svSelectedId);
-                const slug = session?.slug || svSelectedId.slice(0, 8);
+                let slug, exportId;
+                if (svViewingSubagent) {
+                    const sa = svSubagents.find(s => s.id === svViewingSubagent);
+                    slug = (sa?.agentType || 'subagent') + '-' + (sa?.slug || svViewingSubagent.slice(0, 12));
+                    exportId = svViewingSubagent;
+                } else {
+                    slug = session?.slug || svSelectedId.slice(0, 8);
+                    exportId = svSelectedId;
+                }
 
                 // Build markdown
                 let md = '# Session: ' + slug + '\n';
-                md += '- **ID:** ' + svSelectedId + '\n';
+                md += '- **ID:** ' + exportId + '\n';
                 md += '- **Project:** ' + (session?.project || '') + '\n';
                 md += '- **Model:** ' + (session?.model || '') + '\n';
                 md += '- **Status:** ' + (session?.status || '') + '\n';
+                if (svViewingSubagent) md += '- **Parent:** ' + svSelectedId + '\n';
                 md += '- **Events:** ' + allEvents.length + '\n';
                 md += '\n---\n\n';
 
@@ -2280,8 +2488,13 @@
 
         function updateConversationBadge() {
             const badge = document.getElementById('conversationBadge');
-            const session = svSessions.find(s => s.sessionId === svSelectedId);
-            badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
+            if (svViewingSubagent) {
+                const sa = svSubagents.find(s => s.id === svViewingSubagent);
+                badge.textContent = (sa?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events | Subagent';
+            } else {
+                const session = svSessions.find(s => s.sessionId === svSelectedId);
+                badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
+            }
             document.getElementById('exportSessionBtn').style.display = svSelectedId ? '' : 'none';
         }
 
@@ -2481,9 +2694,10 @@
             if (!svSelectedId || !uuid) return;
             btn.disabled = true;
             btn.textContent = 'Loading...';
+            const targetId = svViewingSubagent || svSelectedId;
 
             try {
-                const res = await fetch(SESSION_API + '/' + svSelectedId + '/raw-event/' + uuid);
+                const res = await fetch(SESSION_API + '/' + targetId + '/raw-event/' + uuid);
                 if (!res.ok) throw new Error('Not found');
                 const raw = await res.json();
 
@@ -2511,6 +2725,7 @@
             if (!svSelectedId) return;
             btn.disabled = true;
             btn.textContent = 'Loading...';
+            const targetId = svViewingSubagent || svSelectedId;
 
             // Find the user event that contains this tool_result
             // We need to search through events for the matching tool_use_id
@@ -2526,7 +2741,7 @@
             }
 
             try {
-                const res = await fetch(SESSION_API + '/' + svSelectedId + '/raw-event/' + ev.uuid);
+                const res = await fetch(SESSION_API + '/' + targetId + '/raw-event/' + ev.uuid);
                 if (!res.ok) throw new Error('Not found');
                 const raw = await res.json();
 
@@ -2555,6 +2770,105 @@
             } catch (err) {
                 btn.textContent = 'Error - retry';
                 btn.disabled = false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Subagent Navigation
+        // ═══════════════════════════════════════════════════════════════
+        function renderSubagentBar() {
+            const bar = document.getElementById('subagentBar');
+            const list = document.getElementById('subagentList');
+            const count = document.getElementById('subagentCount');
+
+            if (svSubagents.length === 0) {
+                bar.classList.remove('visible', 'open');
+                return;
+            }
+
+            bar.classList.add('visible');
+            count.textContent = svSubagents.length + ' agent' + (svSubagents.length !== 1 ? 's' : '');
+
+            list.innerHTML = svSubagents.map(sa => {
+                const sel = sa.id === svViewingSubagent ? ' selected' : '';
+                const slug = escapeHtml(sa.slug || sa.id.slice(0, 20));
+                const type = escapeHtml(sa.agentType || 'task-agent');
+                const typeCls = type.replace(/[^a-zA-Z0-9_-]/g, '');
+                return '<div class="subagent-item' + sel + '" data-sa-id="' + escapeHtml(sa.id) + '">' +
+                    '<span class="subagent-status-dot ' + (sa.status === 'active' ? 'active' : 'completed') + '"></span>' +
+                    '<span class="subagent-type-badge ' + typeCls + '">' + type + '</span>' +
+                    '<span class="subagent-slug">' + slug + '</span>' +
+                    '<span class="subagent-meta">' + timeAgo(sa.mtime) + '</span>' +
+                    '</div>';
+            }).join('');
+
+            // Delegated click handler
+            list.onclick = function(e) {
+                const item = e.target.closest('.subagent-item');
+                if (item && item.dataset.saId) viewSubagent(item.dataset.saId);
+            };
+        }
+
+        function toggleSubagentBar() {
+            document.getElementById('subagentBar').classList.toggle('open');
+        }
+
+        async function viewSubagent(subagentId) {
+            svViewingSubagent = subagentId;
+            svParentId = svSelectedId;
+            svEvents = [];
+            svLastEventUUID = null;
+            svAutoScroll = true;
+
+            // Update subagent list selection
+            document.querySelectorAll('.subagent-item').forEach(el => {
+                el.classList.toggle('selected', el.dataset.saId === subagentId);
+            });
+
+            // Show back button
+            document.getElementById('backToParentBtn').style.display = '';
+
+            const sa = svSubagents.find(s => s.id === subagentId);
+            const saLabel = sa ? (sa.agentType + ': ' + (sa.slug || sa.id.slice(0, 12))) : subagentId.slice(0, 16);
+            document.getElementById('conversationTitle').innerHTML = '&#x2B21; ' + escapeHtml(saLabel);
+
+            const viewer = document.getElementById('conversationViewer');
+            viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">Loading subagent...</div></div>';
+
+            try {
+                // Use the subagent filename stem as the session ID for the events endpoint
+                const [evRes, stRes] = await Promise.all([
+                    fetch(SESSION_API + '/' + subagentId + '/events?limit=100'),
+                    fetch(SESSION_API + '/' + subagentId + '/stats'),
+                ]);
+
+                if (evRes.ok) {
+                    const evData = await evRes.json();
+                    svEvents = evData.events || [];
+                    if (svEvents.length > 0) {
+                        svLastEventUUID = svEvents[svEvents.length - 1].uuid;
+                    }
+                    renderConversation();
+                }
+
+                if (stRes.ok) {
+                    const stats = await stRes.json();
+                    renderStatsBar(stats);
+                }
+            } catch (err) {
+                console.error('Subagent load error:', err);
+                viewer.innerHTML = '<div class="no-session"><div class="empty-state-text">Error loading subagent</div></div>';
+            }
+        }
+
+        function backToParentSession() {
+            if (svParentId) {
+                const parentId = svParentId;
+                svViewingSubagent = null;
+                svParentId = null;
+                // Force reload by resetting svSelectedId
+                svSelectedId = null;
+                selectSession(parentId);
             }
         }
 

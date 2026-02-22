@@ -44,6 +44,9 @@ pm2 save
 - "Show full" expansion for truncated content
 - Session stats (model, tokens, duration, tool usage)
 - 3-second polling for active sessions
+- **Subagent visibility** — see spawned subagents (task-agents, compact, prompt_suggestion) per session
+- Navigate into subagent conversations with back-to-parent navigation
+- Export any session or subagent conversation to Markdown
 
 ## Architecture
 
@@ -68,6 +71,7 @@ analyze-session.sh    # Post-session analysis tool
 | `GET /api/sessions/list` | Filterable session list |
 | `GET /api/sessions/:id/events` | Session events (cursor-based) |
 | `GET /api/sessions/:id/stats` | Session statistics |
+| `GET /api/sessions/:id/subagents` | List subagents for a session |
 | `GET /api/sessions/:id/raw-event/:uuid` | Full untruncated event |
 
 ### Session List Params
@@ -81,6 +85,7 @@ Use `after=<uuid>` for cursor-based incremental updates. The server reads from t
 ## Data Sources
 
 - **Session files:** `~/.claude/projects/<project>/<sessionId>.jsonl`
+- **Subagent files:** `~/.claude/projects/<project>/<sessionId>/subagents/*.jsonl`
 - **Process events:** `logs/events_YYYYMMDD.jsonl` (written by claude-tracker.sh)
 
 ## Requirements

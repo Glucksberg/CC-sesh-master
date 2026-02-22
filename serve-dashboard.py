@@ -42,25 +42,34 @@ class SessionIndex:
 
     def __init__(self):
         self._sessions = {}
+        self._subagents = {}   # parentId -> [subagent, ...]
+        self._subagent_paths = {}  # filename_stem -> path
         self._projects = set()
         self._last_rebuild = 0
         self._rebuild_interval = 30
         self._lock = threading.Lock()
+        self._rebuild_lock = threading.Lock()
 
     def _needs_rebuild(self):
         return time.time() - self._last_rebuild > self._rebuild_interval
 
     def ensure_fresh(self):
         if self._needs_rebuild():
-            self.rebuild()
+            with self._rebuild_lock:
+                if self._needs_rebuild():  # double-check under lock
+                    self.rebuild()
 
     def rebuild(self):
         sessions = {}
+        subagents = {}      # parentId -> [subagent_info, ...]
+        subagent_paths = {} # filename_stem -> path str
         projects = set()
 
         if not PROJECTS_DIR.exists():
             with self._lock:
                 self._sessions = sessions
+                self._subagents = subagents
+                self._subagent_paths = subagent_paths
                 self._projects = projects
                 self._last_rebuild = time.time()
             return
@@ -107,6 +116,20 @@ class SessionIndex:
                 age = time.time() - mtime
                 active = age < 120 and not meta.get('has_stop', False)
 
+                # Scan subagents for this session
+                sub_dir = proj_dir / sid / 'subagents'
+                sub_list = []
+                if sub_dir.is_dir():
+                    for sa_file in sub_dir.glob('*.jsonl'):
+                        sa_info = self._extract_subagent_info(sa_file, sid)
+                        if sa_info:
+                            sub_list.append(sa_info)
+                            subagent_paths[sa_file.stem] = str(sa_file)
+                    sub_list.sort(key=lambda x: x['mtime'], reverse=True)
+
+                if sub_list:
+                    subagents[sid] = sub_list
+
                 sessions[sid] = {
                     'sessionId': sid,
                     'project': display,
@@ -119,11 +142,14 @@ class SessionIndex:
                     'eventCount': meta.get('event_count', 0),
                     'cwd': meta.get('cwd', ''),
                     'gitBranch': meta.get('gitBranch', ''),
+                    'subagentCount': len(sub_list),
                     '_path': str(jsonl_file),
                 }
 
         with self._lock:
             self._sessions = sessions
+            self._subagents = subagents
+            self._subagent_paths = subagent_paths
             self._projects = projects
             self._last_rebuild = time.time()
 
@@ -186,6 +212,66 @@ class SessionIndex:
 
         return meta
 
+    @staticmethod
+    def _extract_subagent_info(path, parent_id):
+        """Extract info from a subagent JSONL file."""
+        try:
+            st = path.stat()
+            size = st.st_size
+            mtime = st.st_mtime
+        except OSError:
+            return None
+
+        if size == 0:
+            return None
+
+        filename = path.stem  # e.g. agent-aprompt_suggestion-fcffe7
+        # Parse agent type from filename
+        agent_type = 'task-agent'
+        if 'prompt_suggestion' in filename:
+            agent_type = 'prompt_suggestion'
+        elif 'compact' in filename:
+            agent_type = 'compact'
+
+        info = {
+            'id': filename,
+            'parentId': parent_id,
+            'agentType': agent_type,
+            'filename': path.name,
+            'size': size,
+            'mtime': mtime,
+            'eventCount': max(1, size // 500),
+            'slug': '',
+            'model': '',
+        }
+
+        # Read first few lines for metadata
+        try:
+            with open(path, 'r', errors='replace') as f:
+                for _ in range(5):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if not info['slug']:
+                            info['slug'] = obj.get('slug', '')
+                        if not info['model'] and obj.get('type') == 'assistant':
+                            info['model'] = obj.get('message', {}).get('model', '')
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        except OSError:
+            pass
+
+        # Determine active state
+        age = time.time() - mtime
+        info['status'] = 'active' if age < 120 else 'completed'
+
+        return info
+
     # ── query interface ───────────────────────────────────────────────────
 
     def get_sessions(self, project=None, status=None, search=None,
@@ -237,15 +323,32 @@ class SessionIndex:
             s = self._sessions.get(session_id)
             if s:
                 return s.get('_path')
+            # Check if it's a subagent filename stem
+            sa_path = self._subagent_paths.get(session_id)
+            if sa_path:
+                return sa_path
+        # Validate format before filesystem fallback (prevent path traversal)
+        if not re.match(r'^[a-zA-Z0-9_-]+$', session_id):
+            return None
         # Fallback filesystem scan
         if PROJECTS_DIR.exists():
             for d in PROJECTS_DIR.iterdir():
                 if not d.is_dir():
                     continue
-                p = d / f'{session_id}.jsonl'
+                p = (d / f'{session_id}.jsonl').resolve()
+                try:
+                    p.relative_to(PROJECTS_DIR.resolve())
+                except ValueError:
+                    continue
                 if p.exists():
                     return str(p)
         return None
+
+    def get_subagents(self, session_id):
+        """Get subagents for a parent session."""
+        self.ensure_fresh()
+        with self._lock:
+            return list(self._subagents.get(session_id, []))
 
 
 # ─── Session Event Reader ──────────────────────────────────────────────────────
@@ -622,6 +725,9 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         elif re.match(r'^/api/sessions/[^/]+/stats$', path):
             sid = path.split('/')[3]
             self.handle_session_stats(sid)
+        elif re.match(r'^/api/sessions/[^/]+/subagents$', path):
+            sid = path.split('/')[3]
+            self.handle_session_subagents(sid)
         elif re.match(r'^/api/sessions/[^/]+/raw-event/[^/]+$', path):
             parts = path.split('/')
             self.handle_raw_event(parts[3], parts[5])
@@ -701,6 +807,17 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 return
             stats = SessionEventReader.get_stats(path)
             self.send_json(stats)
+        except Exception as e:
+            self.send_json({'error': str(e)}, status=500)
+
+    def handle_session_subagents(self, session_id):
+        try:
+            subagents = session_index.get_subagents(session_id)
+            self.send_json({
+                'sessionId': session_id,
+                'subagents': subagents,
+                'total': len(subagents),
+            })
         except Exception as e:
             self.send_json({'error': str(e)}, status=500)
 
