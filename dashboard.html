@@ -1068,6 +1068,32 @@
             border-radius: 3px;
         }
 
+        .export-btn {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.65rem;
+            background: rgba(0, 255, 136, 0.08);
+            border: 1px solid var(--phosphor-dim);
+            color: var(--phosphor-green);
+            padding: 4px 12px;
+            border-radius: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            white-space: nowrap;
+        }
+
+        .export-btn:hover {
+            background: rgba(0, 255, 136, 0.15);
+            box-shadow: 0 0 8px rgba(0, 255, 136, 0.2);
+        }
+
+        .export-btn:disabled {
+            opacity: 0.4;
+            cursor: default;
+            box-shadow: none;
+        }
+
         .load-earlier-btn {
             display: block;
             margin: 0 auto 16px;
@@ -1129,6 +1155,14 @@
             display: flex;
             align-items: center;
             gap: 8px;
+        }
+
+        .msg-timestamp {
+            font-weight: 400;
+            font-size: 0.6rem;
+            color: var(--text-muted);
+            letter-spacing: 0;
+            margin-left: auto;
         }
 
         .msg-model-tag {
@@ -1538,7 +1572,10 @@
                     <div class="conversation-panel">
                         <div class="panel-header">
                             <span class="panel-title" id="conversationTitle">&#x25C8; Conversation</span>
-                            <span class="panel-badge" id="conversationBadge">Select a session</span>
+                            <div style="display:flex;align-items:center;gap:8px">
+                                <button class="export-btn" id="exportSessionBtn" onclick="exportSession()" style="display:none">&#x2B07; Export</button>
+                                <span class="panel-badge" id="conversationBadge">Select a session</span>
+                            </div>
                         </div>
                         <div class="conversation-viewer" id="conversationViewer">
                             <div class="no-session">
@@ -2167,10 +2204,85 @@
             }
         }
 
+        async function exportSession() {
+            if (!svSelectedId) return;
+            const btn = document.getElementById('exportSessionBtn');
+            btn.disabled = true;
+            btn.textContent = 'Exporting...';
+
+            try {
+                // Fetch all events (larger limit)
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/events?limit=5000');
+                if (!res.ok) throw new Error('Failed');
+                const data = await res.json();
+                const allEvents = data.events || [];
+
+                const session = svSessions.find(s => s.sessionId === svSelectedId);
+                const slug = session?.slug || svSelectedId.slice(0, 8);
+
+                // Build markdown
+                let md = '# Session: ' + slug + '\n';
+                md += '- **ID:** ' + svSelectedId + '\n';
+                md += '- **Project:** ' + (session?.project || '') + '\n';
+                md += '- **Model:** ' + (session?.model || '') + '\n';
+                md += '- **Status:** ' + (session?.status || '') + '\n';
+                md += '- **Events:** ' + allEvents.length + '\n';
+                md += '\n---\n\n';
+
+                for (const ev of allEvents) {
+                    const time = formatEventTime(ev.timestamp);
+                    const ts = time ? '[' + time + '] ' : '';
+
+                    if (ev.type === 'user') {
+                        if (ev.tool_results && ev.tool_results.length > 0) {
+                            for (const tr of ev.tool_results) {
+                                const label = tr.is_error ? 'TOOL ERROR' : 'TOOL RESULT';
+                                md += '### ' + ts + label + '\n\n';
+                                md += '```\n' + (tr.content || '') + '\n```\n\n';
+                            }
+                        } else if (ev.text) {
+                            const label = ev.userType === 'external' ? 'USER' : (ev.userType || 'SYSTEM');
+                            md += '## ' + ts + label + '\n\n';
+                            md += ev.text + '\n\n';
+                        }
+                    } else if (ev.type === 'assistant') {
+                        if (ev.text) {
+                            md += '## ' + ts + 'ASSISTANT\n\n';
+                            md += ev.text + '\n\n';
+                        }
+                        if (ev.tool_uses) {
+                            for (const tu of ev.tool_uses) {
+                                md += '### ' + ts + 'Tool Call: ' + tu.name + '\n\n';
+                                md += '```json\n' + (tu.input || '') + '\n```\n\n';
+                            }
+                        }
+                    } else if (ev.type === 'system') {
+                        md += '---\n\n*[' + (ev.subtype || 'system') + ']*\n\n---\n\n';
+                    }
+                }
+
+                // Download
+                const blob = new Blob([md], { type: 'text/markdown' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = slug + '.md';
+                a.click();
+                URL.revokeObjectURL(url);
+            } catch (err) {
+                console.error('Export error:', err);
+                alert('Export failed: ' + err.message);
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = '&#x2B07; Export';
+        }
+
         function updateConversationBadge() {
             const badge = document.getElementById('conversationBadge');
             const session = svSessions.find(s => s.sessionId === svSelectedId);
             badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
+            document.getElementById('exportSessionBtn').style.display = svSelectedId ? '' : 'none';
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -2217,16 +2329,19 @@
                 return;
             }
 
-            let html = '<button class="load-earlier-btn" onclick="loadEarlierEvents()">Load Earlier Messages</button>';
+            let html = '';
 
-            for (const ev of svEvents) {
-                html += renderEvent(ev);
+            // Newest first
+            for (let i = svEvents.length - 1; i >= 0; i--) {
+                html += renderEvent(svEvents[i]);
             }
+
+            html += '<button class="load-earlier-btn" onclick="loadEarlierEvents()">Load Earlier Messages</button>';
 
             viewer.innerHTML = html;
 
             if (autoScroll && svAutoScroll) {
-                viewer.scrollTop = viewer.scrollHeight;
+                viewer.scrollTop = 0;
             }
         }
 
@@ -2264,25 +2379,40 @@
             return '';
         }
 
+        function formatEventTime(ts) {
+            if (!ts) return '';
+            let d;
+            if (typeof ts === 'number') {
+                d = new Date(ts > 1e12 ? ts : ts * 1000);
+            } else {
+                d = new Date(ts);
+            }
+            if (isNaN(d.getTime())) return '';
+            return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
         function renderUserMessage(ev) {
+            const time = formatEventTime(ev.timestamp);
             return '<div class="msg-bubble msg-user">' +
-                '<div class="msg-label">USER</div>' +
+                '<div class="msg-label">USER' + (time ? '<span class="msg-timestamp">' + time + '</span>' : '') + '</div>' +
                 '<div class="msg-text">' + escapeHtml(ev.text) + '</div>' +
                 (ev.truncated ? '<div style="color:var(--text-muted);font-size:0.65rem;margin-top:4px">[truncated]</div>' : '') +
                 '</div>';
         }
 
         function renderHookMessage(ev) {
+            const time = formatEventTime(ev.timestamp);
             return '<div class="msg-bubble msg-user" style="opacity:0.6;border-left-color:var(--text-muted)">' +
-                '<div class="msg-label" style="color:var(--text-muted)">' + escapeHtml(ev.userType || 'SYSTEM') + '</div>' +
+                '<div class="msg-label" style="color:var(--text-muted)">' + escapeHtml(ev.userType || 'SYSTEM') + (time ? '<span class="msg-timestamp">' + time + '</span>' : '') + '</div>' +
                 '<div class="msg-text" style="font-size:0.7rem;color:var(--text-secondary)">' + escapeHtml((ev.text || '').slice(0, 500)) + '</div>' +
                 '</div>';
         }
 
         function renderAssistantMessage(ev) {
             const modelTag = ev.model ? '<span class="msg-model-tag">' + escapeHtml(shortModel(ev.model)) + '</span>' : '';
+            const time = formatEventTime(ev.timestamp);
             return '<div class="msg-bubble msg-assistant">' +
-                '<div class="msg-label">ASSISTANT ' + modelTag + '</div>' +
+                '<div class="msg-label">ASSISTANT ' + modelTag + (time ? '<span class="msg-timestamp">' + time + '</span>' : '') + '</div>' +
                 '<div class="msg-text">' + escapeHtml(ev.text) + '</div>' +
                 '</div>';
         }
@@ -2434,8 +2564,8 @@
         document.addEventListener('DOMContentLoaded', () => {
             const viewer = document.getElementById('conversationViewer');
             viewer.addEventListener('scroll', () => {
-                const nearBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 80;
-                svAutoScroll = nearBottom;
+                const nearTop = viewer.scrollTop < 80;
+                svAutoScroll = nearTop;
             });
         });
 
