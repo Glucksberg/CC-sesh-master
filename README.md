@@ -47,6 +47,7 @@ pm2 save
 - **Subagent visibility** — see spawned subagents (task-agents, compact, prompt_suggestion) per session
 - Navigate into subagent conversations with back-to-parent navigation
 - Export any session or subagent conversation to Markdown
+- **OpenClaw integration** — auto-discovers sessions from `~/.openclaw/agents/*/sessions/` with full event parsing
 
 ## Architecture
 
@@ -86,6 +87,7 @@ Use `after=<uuid>` for cursor-based incremental updates. The server reads from t
 
 - **Session files:** `~/.claude/projects/<project>/<sessionId>.jsonl`
 - **Subagent files:** `~/.claude/projects/<project>/<sessionId>/subagents/*.jsonl`
+- **OpenClaw sessions:** `~/.openclaw/agents/<agent>/sessions/<sessionId>.jsonl`
 - **Process events:** `logs/events_YYYYMMDD.jsonl` (written by claude-tracker.sh)
 
 ## Requirements

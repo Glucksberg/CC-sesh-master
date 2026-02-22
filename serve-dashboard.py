@@ -24,6 +24,7 @@ LOG_DIR = SCRIPT_DIR / "logs"
 CLAUDE_DIR = Path.home() / '.claude'
 PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
+OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 
 # Allowed origins for CORS (localhost only)
 ALLOWED_ORIGINS = {'http://localhost:37778', 'http://127.0.0.1:37778', 'null'}
@@ -65,86 +66,42 @@ class SessionIndex:
         subagent_paths = {} # filename_stem -> path str
         projects = set()
 
-        if not PROJECTS_DIR.exists():
-            with self._lock:
-                self._sessions = sessions
-                self._subagents = subagents
-                self._subagent_paths = subagent_paths
-                self._projects = projects
-                self._last_rebuild = time.time()
-            return
-
-        for proj_dir in PROJECTS_DIR.iterdir():
-            if not proj_dir.is_dir():
-                continue
-
-            proj_name = proj_dir.name
-            if 'observer' in proj_name.lower():
-                continue
-
-            # Clean project display name
-            display = proj_name
-            if display.startswith('-home-dev-'):
-                display = display[10:]
-            elif display.startswith('-home-dev'):
-                display = display[9:] or 'home'
-            display = display.replace('-', '/') if display else 'home'
-
-            for jsonl_file in proj_dir.glob('*.jsonl'):
-                sid = jsonl_file.stem
-                if not re.match(
-                    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-                    sid,
-                ):
+        # ── Scan ~/.claude/projects/ ─────────────────────────────────
+        if PROJECTS_DIR.exists():
+            for proj_dir in PROJECTS_DIR.iterdir():
+                if not proj_dir.is_dir():
                     continue
 
-                try:
-                    st = jsonl_file.stat()
-                    mtime = st.st_mtime
-                    size = st.st_size
-                except OSError:
+                proj_name = proj_dir.name
+                if 'observer' in proj_name.lower():
                     continue
 
-                if size == 0:
+                # Clean project display name
+                display = proj_name
+                if display.startswith('-home-dev-'):
+                    display = display[10:]
+                elif display.startswith('-home-dev'):
+                    display = display[9:] or 'home'
+                display = display.replace('-', '/') if display else 'home'
+
+                self._scan_session_dir(
+                    proj_dir, display, sessions, subagents,
+                    subagent_paths, projects,
+                )
+
+        # ── Scan ~/.openclaw/agents/*/sessions/ ──────────────────────
+        if OPENCLAW_DIR.exists():
+            for agent_dir in OPENCLAW_DIR.iterdir():
+                if not agent_dir.is_dir():
                     continue
-
-                meta = self._extract_metadata(jsonl_file, size)
-                if meta is None:
+                sess_dir = agent_dir / 'sessions'
+                if not sess_dir.is_dir():
                     continue
-
-                projects.add(display)
-                age = time.time() - mtime
-                active = age < 120 and not meta.get('has_stop', False)
-
-                # Scan subagents for this session
-                sub_dir = proj_dir / sid / 'subagents'
-                sub_list = []
-                if sub_dir.is_dir():
-                    for sa_file in sub_dir.glob('*.jsonl'):
-                        sa_info = self._extract_subagent_info(sa_file, sid)
-                        if sa_info:
-                            sub_list.append(sa_info)
-                            subagent_paths[sa_file.stem] = str(sa_file)
-                    sub_list.sort(key=lambda x: x['mtime'], reverse=True)
-
-                if sub_list:
-                    subagents[sid] = sub_list
-
-                sessions[sid] = {
-                    'sessionId': sid,
-                    'project': display,
-                    'slug': meta.get('slug', ''),
-                    'status': 'active' if active else 'completed',
-                    'model': meta.get('model', ''),
-                    'version': meta.get('version', ''),
-                    'mtime': mtime,
-                    'size': size,
-                    'eventCount': meta.get('event_count', 0),
-                    'cwd': meta.get('cwd', ''),
-                    'gitBranch': meta.get('gitBranch', ''),
-                    'subagentCount': len(sub_list),
-                    '_path': str(jsonl_file),
-                }
+                display = 'openclaw/' + agent_dir.name
+                self._scan_session_dir(
+                    sess_dir, display, sessions, subagents,
+                    subagent_paths, projects,
+                )
 
         with self._lock:
             self._sessions = sessions
@@ -152,6 +109,65 @@ class SessionIndex:
             self._subagent_paths = subagent_paths
             self._projects = projects
             self._last_rebuild = time.time()
+
+    def _scan_session_dir(self, sess_dir, display, sessions, subagents,
+                          subagent_paths, projects):
+        """Scan a directory for UUID-named .jsonl session files."""
+        for jsonl_file in sess_dir.glob('*.jsonl'):
+            sid = jsonl_file.stem
+            if not re.match(
+                r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+                sid,
+            ):
+                continue
+
+            try:
+                st = jsonl_file.stat()
+                mtime = st.st_mtime
+                size = st.st_size
+            except OSError:
+                continue
+
+            if size == 0:
+                continue
+
+            meta = self._extract_metadata(jsonl_file, size)
+            if meta is None:
+                continue
+
+            projects.add(display)
+            age = time.time() - mtime
+            active = age < 120 and not meta.get('has_stop', False)
+
+            # Scan subagents for this session
+            sub_dir = sess_dir / sid / 'subagents'
+            sub_list = []
+            if sub_dir.is_dir():
+                for sa_file in sub_dir.glob('*.jsonl'):
+                    sa_info = self._extract_subagent_info(sa_file, sid)
+                    if sa_info:
+                        sub_list.append(sa_info)
+                        subagent_paths[sa_file.stem] = str(sa_file)
+                sub_list.sort(key=lambda x: x['mtime'], reverse=True)
+
+            if sub_list:
+                subagents[sid] = sub_list
+
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'slug': meta.get('slug', ''),
+                'status': 'active' if active else 'completed',
+                'model': meta.get('model', ''),
+                'version': meta.get('version', ''),
+                'mtime': mtime,
+                'size': size,
+                'eventCount': meta.get('event_count', 0),
+                'cwd': meta.get('cwd', ''),
+                'gitBranch': meta.get('gitBranch', ''),
+                'subagentCount': len(sub_list),
+                '_path': str(jsonl_file),
+            }
 
     # ── metadata helpers ──────────────────────────────────────────────────
 
@@ -162,7 +178,7 @@ class SessionIndex:
         try:
             with open(path, 'r', errors='replace') as f:
                 # First few lines
-                for _ in range(5):
+                for _ in range(8):
                     line = f.readline()
                     if not line:
                         break
@@ -171,16 +187,41 @@ class SessionIndex:
                         continue
                     try:
                         obj = json.loads(line)
+                        t = obj.get('type', '')
+
+                        # Claude Code native format
                         if not meta.get('slug'):
                             meta['slug'] = obj.get('slug', '')
                         if not meta.get('cwd'):
                             meta['cwd'] = obj.get('cwd', '')
-                        if not meta.get('version'):
-                            meta['version'] = obj.get('version', '')
                         if not meta.get('gitBranch'):
                             meta['gitBranch'] = obj.get('gitBranch', '')
-                        if not meta.get('model') and obj.get('type') == 'assistant':
+
+                        if t == 'assistant' and not meta.get('model'):
                             meta['model'] = obj.get('message', {}).get('model', '')
+
+                        # OpenClaw format: first line is type=session
+                        if t == 'session':
+                            if not meta.get('cwd'):
+                                meta['cwd'] = obj.get('cwd', '')
+                            ver = obj.get('version', '')
+                            if ver and not meta.get('version'):
+                                meta['version'] = str(ver)
+                            meta['_openclaw'] = True
+
+                        # OpenClaw message format
+                        if t == 'message':
+                            msg = obj.get('message', {})
+                            role = msg.get('role', '')
+                            if role == 'assistant' and not meta.get('model'):
+                                model = msg.get('model', '')
+                                if model and model != 'delivery-mirror':
+                                    meta['model'] = model
+
+                        # Claude Code version string
+                        if not meta.get('version') and isinstance(obj.get('version'), str):
+                            meta['version'] = obj['version']
+
                     except (json.JSONDecodeError, KeyError):
                         pass
 
@@ -197,10 +238,18 @@ class SessionIndex:
                         continue
                     try:
                         obj = json.loads(line)
-                        if obj.get('type') == 'system' and obj.get('subtype') == 'stop_hook_summary':
+                        t = obj.get('type', '')
+                        if t == 'system' and obj.get('subtype') == 'stop_hook_summary':
                             meta['has_stop'] = True
-                        if not meta.get('model') and obj.get('type') == 'assistant':
-                            meta['model'] = obj.get('message', {}).get('model', '')
+                        if not meta.get('model'):
+                            if t == 'assistant':
+                                meta['model'] = obj.get('message', {}).get('model', '')
+                            elif t == 'message':
+                                msg = obj.get('message', {})
+                                if msg.get('role') == 'assistant':
+                                    model = msg.get('model', '')
+                                    if model and model != 'delivery-mirror':
+                                        meta['model'] = model
                         if not meta.get('slug') and obj.get('slug'):
                             meta['slug'] = obj['slug']
                         break
@@ -356,7 +405,10 @@ class SessionIndex:
 class SessionEventReader:
     """Reads and processes events from session JSONL files."""
 
-    _SKIP_TYPES = frozenset(['file-history-snapshot', 'queue-operation'])
+    _SKIP_TYPES = frozenset([
+        'file-history-snapshot', 'queue-operation',
+        'session', 'thinking_level_change', 'custom',
+    ])
 
     @classmethod
     def read_events(cls, path, after=None, limit=100, types=None):
@@ -391,7 +443,7 @@ class SessionEventReader:
                     if not found:
                         try:
                             obj = json.loads(line)
-                            if obj.get('uuid') == after:
+                            if obj.get('uuid') == after or obj.get('id') == after:
                                 found = True
                         except json.JSONDecodeError:
                             pass
@@ -413,7 +465,7 @@ class SessionEventReader:
                     if not found:
                         try:
                             obj = json.loads(line)
-                            if obj.get('uuid') == after:
+                            if obj.get('uuid') == after or obj.get('id') == after:
                                 found = True
                         except json.JSONDecodeError:
                             pass
@@ -463,9 +515,103 @@ class SessionEventReader:
             return None
 
         t = raw.get('type')
-        if t in ('file-history-snapshot', 'queue-operation'):
+        if t in ('file-history-snapshot', 'queue-operation',
+                 'session', 'thinking_level_change', 'custom'):
             return None
 
+        # ── OpenClaw format: type="message" with message.role ─────────
+        if t == 'message':
+            msg = raw.get('message', {})
+            role = msg.get('role', '')
+            t = {'user': 'user', 'assistant': 'assistant',
+                 'toolResult': 'user'}.get(role)
+            if not t:
+                return None
+
+            result = {
+                'type': t,
+                'uuid': raw.get('id', ''),
+                'timestamp': raw.get('timestamp', ''),
+            }
+
+            if role == 'user':
+                result['userType'] = 'external'
+                content = msg.get('content', '')
+                if isinstance(content, str):
+                    result['text'] = content[:MAX_TEXT_LEN]
+                    result['truncated'] = len(content) > MAX_TEXT_LEN
+                elif isinstance(content, list):
+                    texts = [b.get('text', '')[:MAX_TEXT_LEN]
+                             for b in content
+                             if isinstance(b, dict) and b.get('type') == 'text']
+                    if texts:
+                        joined = '\n'.join(texts)
+                        result['text'] = joined[:MAX_TEXT_LEN]
+                        result['truncated'] = len(joined) > MAX_TEXT_LEN
+
+            elif role == 'toolResult':
+                result['userType'] = 'external'
+                content = msg.get('content', [])
+                tool_call_id = msg.get('toolCallId', '')
+                if isinstance(content, list):
+                    parts = [b.get('text', '')
+                             for b in content
+                             if isinstance(b, dict) and b.get('type') == 'text']
+                    full = '\n'.join(parts)
+                elif isinstance(content, str):
+                    full = content
+                else:
+                    full = ''
+                is_err = msg.get('details', {}).get('exitCode', 0) != 0
+                result['tool_results'] = [{
+                    'tool_use_id': tool_call_id,
+                    'type': 'tool_result',
+                    'content': full[:MAX_TOOL_RESULT_LEN],
+                    'truncated': len(full) > MAX_TOOL_RESULT_LEN,
+                    **(({'is_error': True}) if is_err else {}),
+                }]
+
+            elif role == 'assistant':
+                model = msg.get('model', '')
+                if model == 'delivery-mirror':
+                    model = ''
+                result['model'] = model
+                result['usage'] = msg.get('usage', {})
+                result['stop_reason'] = msg.get('stop_reason', '')
+
+                texts = []
+                tool_uses = []
+                content = msg.get('content', [])
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        bt = block.get('type')
+                        if bt == 'text':
+                            texts.append(block.get('text', '')[:MAX_TEXT_LEN])
+                        elif bt == 'toolCall':
+                            inp = json.dumps(
+                                block.get('arguments', {}),
+                                ensure_ascii=False,
+                            )
+                            tool_uses.append({
+                                'type': 'tool_use',
+                                'id': block.get('id', ''),
+                                'name': block.get('name', ''),
+                                'input': inp[:MAX_TOOL_INPUT_LEN],
+                                'truncated': len(inp) > MAX_TOOL_INPUT_LEN,
+                            })
+                        elif bt == 'thinking':
+                            result['hasThinking'] = True
+
+                if texts:
+                    result['text'] = '\n'.join(texts)
+                if tool_uses:
+                    result['tool_uses'] = tool_uses
+
+            return result
+
+        # ── Claude Code native format ─────────────────────────────────
         result = {
             'type': t,
             'uuid': raw.get('uuid', ''),
@@ -577,7 +723,7 @@ class SessionEventReader:
                     for line in f:
                         try:
                             obj = json.loads(line.strip())
-                            if obj.get('uuid') == event_uuid:
+                            if obj.get('uuid') == event_uuid or obj.get('id') == event_uuid:
                                 return obj
                         except json.JSONDecodeError:
                             pass
@@ -586,7 +732,7 @@ class SessionEventReader:
                 for line in f:
                     try:
                         obj = json.loads(line.strip())
-                        if obj.get('uuid') == event_uuid:
+                        if obj.get('uuid') == event_uuid or obj.get('id') == event_uuid:
                             return obj
                     except json.JSONDecodeError:
                         pass
@@ -639,10 +785,12 @@ class SessionEventReader:
                     if not stats['gitBranch'] and raw.get('gitBranch'):
                         stats['gitBranch'] = raw['gitBranch']
                     if not stats['version'] and raw.get('version'):
-                        stats['version'] = raw['version']
+                        stats['version'] = str(raw['version'])
 
+                    msg = raw.get('message', {})
+
+                    # Claude Code native: type == 'assistant'
                     if et == 'assistant':
-                        msg = raw.get('message', {})
                         if not stats['model'] and msg.get('model'):
                             stats['model'] = msg['model']
                         usage = msg.get('usage', {})
@@ -660,6 +808,34 @@ class SessionEventReader:
                                 stats['tool_calls'][name] = (
                                     stats['tool_calls'].get(name, 0) + 1
                                 )
+
+                    # OpenClaw format: type == 'message'
+                    elif et == 'message':
+                        role = msg.get('role', '')
+                        if role == 'assistant':
+                            model = msg.get('model', '')
+                            if not stats['model'] and model and model != 'delivery-mirror':
+                                stats['model'] = model
+                            usage = msg.get('usage', {})
+                            # OpenClaw uses 'input'/'output', Claude uses 'input_tokens'/'output_tokens'
+                            stats['tokens']['input'] += (
+                                usage.get('input_tokens', 0) or usage.get('input', 0)
+                            )
+                            stats['tokens']['output'] += (
+                                usage.get('output_tokens', 0) or usage.get('output', 0)
+                            )
+                            stats['tokens']['cache_read'] += (
+                                usage.get('cache_read_input_tokens', 0) or usage.get('cacheRead', 0)
+                            )
+                            stats['tokens']['cache_creation'] += (
+                                usage.get('cache_creation_input_tokens', 0) or usage.get('cacheWrite', 0)
+                            )
+                            for block in msg.get('content', []):
+                                if isinstance(block, dict) and block.get('type') == 'toolCall':
+                                    name = block.get('name', 'unknown')
+                                    stats['tool_calls'][name] = (
+                                        stats['tool_calls'].get(name, 0) + 1
+                                    )
         except OSError as e:
             print(f"Error reading stats: {e}", file=sys.stderr)
 
