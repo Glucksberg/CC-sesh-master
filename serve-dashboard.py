@@ -76,6 +76,9 @@ class SessionIndex:
                 proj_name = proj_dir.name
                 if 'observer' in proj_name.lower():
                     continue
+                # Skip OpenClaw subagent workspace dirs (shown via parent's subagent panel)
+                if 'openclaw-workspace' in proj_name:
+                    continue
 
                 # Clean project display name
                 display = proj_name
