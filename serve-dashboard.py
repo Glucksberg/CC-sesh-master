@@ -324,15 +324,20 @@ class SessionIndex:
                                 if it:
                                     meta['last_input_tokens'] = it
 
-                        if not meta.get('model'):
+                        # Always take model from tail (most recent)
+                        if not meta.get('_tail_model'):
                             if t == 'assistant':
-                                meta['model'] = obj.get('message', {}).get('model', '')
+                                m = obj.get('message', {}).get('model', '')
+                                if m:
+                                    meta['model'] = m
+                                    meta['_tail_model'] = True
                             elif t == 'message':
                                 msg = obj.get('message', {})
                                 if msg.get('role') == 'assistant':
-                                    model = msg.get('model', '')
-                                    if model and model != 'delivery-mirror':
-                                        meta['model'] = model
+                                    m = msg.get('model', '')
+                                    if m and m != 'delivery-mirror':
+                                        meta['model'] = m
+                                        meta['_tail_model'] = True
                         if not meta.get('slug') and obj.get('slug'):
                             meta['slug'] = obj['slug']
 
@@ -570,8 +575,11 @@ class SessionIndex:
                             continue
                         if t == 'event_msg' and payload.get('type') == 'task_complete':
                             meta['has_complete'] = True
-                        if not meta.get('model') and t == 'turn_context':
-                            meta['model'] = payload.get('model', '')
+                        if not meta.get('_tail_model') and t == 'turn_context':
+                            m = payload.get('model', '')
+                            if m:
+                                meta['model'] = m
+                                meta['_tail_model'] = True
                         if meta.get('has_complete') and meta.get('model'):
                             break
                     except (json.JSONDecodeError, KeyError):
