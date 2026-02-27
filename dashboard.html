@@ -1115,6 +1115,12 @@
             color: var(--anomaly-color);
         }
 
+        .session-badge.ctx-low { color: #888; }
+        .session-badge.ctx-mid { color: #f0c040; }
+        .session-badge.ctx-high { color: #ff8c00; }
+        .session-badge.ctx-critical { color: #ff4444; font-weight: bold; }
+        .session-badge.duration { color: #999; }
+
         /* Subagent bar */
         .subagent-bar {
             display: none;
@@ -1734,8 +1740,13 @@
                     <div class="sidebar-header">
                         <div class="panel-title">&#x25C8; Sessions</div>
                         <div class="filter-group">
-                            <input type="text" class="filter-input" id="sessionSearch"
-                                   placeholder="Search sessions..." autocomplete="off">
+                            <div style="display:flex;gap:4px;align-items:center">
+                                <input type="text" class="filter-input" id="sessionSearch"
+                                       placeholder="Search sessions..." autocomplete="off" style="flex:1">
+                                <button id="searchModeToggle" title="Switch to content search"
+                                        style="background:#1a1a2e;border:1px solid #333;color:#888;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap"
+                                        onclick="toggleSearchMode()">&#x1F50D; Name</button>
+                            </div>
                             <div class="filter-row">
                                 <select class="filter-select" id="sessionProject">
                                     <option value="">All Projects</option>
@@ -1793,6 +1804,7 @@
                             <div style="display:flex;align-items:center;gap:8px">
                                 <button class="back-to-parent-btn" id="backToParentBtn" onclick="backToParentSession()" style="display:none">&#x25C0; Parent</button>
                                 <button class="export-btn" id="exportSessionBtn" onclick="exportSession()" style="display:none">&#x2B07; Export</button>
+                                <button class="export-btn" id="copySessionBtn" onclick="copySession()" style="display:none">&#x2398; Copy</button>
                                 <span class="panel-badge" id="conversationBadge">Select a session</span>
                             </div>
                         </div>
@@ -1839,8 +1851,8 @@
         const API_URL = 'http://localhost:37778/api/tracker';
         const SESSION_API = 'http://localhost:37778/api/sessions';
         const POLL_INTERVAL = 2000;
-        const SESSION_LIST_POLL = 10000;
-        const SESSION_EVENTS_POLL = 3000;
+        const SESSION_LIST_POLL = 1000;
+        const SESSION_EVENTS_POLL = 1000;
         const MAX_EVENTS = 100;
         const MAX_CHART_POINTS = 60;
 
@@ -1875,6 +1887,7 @@
         let svTotal = 0;
         let svProjects = [];
         let svSearchTimer = null;
+        let svSearchMode = 'name'; // 'name' or 'content'
         let svSubagents = [];        // subagents for current parent session
         let svViewingSubagent = null; // subagent ID if viewing a subagent conversation
         let svParentId = null;        // parent session ID when viewing subagent
@@ -1913,10 +1926,22 @@
         function formatDuration(seconds) {
             if (!seconds || seconds < 0) return '0s';
             if (seconds < 60) return seconds + 's';
-            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
-            const h = Math.floor(seconds / 3600);
-            const m = Math.floor((seconds % 3600) / 60);
-            return h + 'h ' + m + 'm';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+            if (seconds < 86400) {
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                return h + 'h ' + m + 'm';
+            }
+            const d = Math.floor(seconds / 86400);
+            const h = Math.floor((seconds % 86400) / 3600);
+            return d + 'd ' + h + 'h';
+        }
+
+        function contextClass(pct) {
+            if (pct > 90) return 'ctx-critical';
+            if (pct > 75) return 'ctx-high';
+            if (pct > 50) return 'ctx-mid';
+            return 'ctx-low';
         }
 
         function formatTokens(n) {
@@ -2112,7 +2137,10 @@
             processCount.textContent = processes.length + ' processes';
         }
 
+        let fetchDataBusy = false;
         async function fetchData() {
+            if (fetchDataBusy) return;
+            fetchDataBusy = true;
             const ctrl = new AbortController();
             const tid = setTimeout(() => ctrl.abort(), 5000);
             try {
@@ -2150,6 +2178,8 @@
             } catch (err) {
                 clearTimeout(tid);
                 setConnectionStatus(false);
+            } finally {
+                fetchDataBusy = false;
             }
         }
 
@@ -2221,14 +2251,17 @@
         function startEventPolling() {
             if (sessionEventsPollingId) clearInterval(sessionEventsPollingId);
             sessionEventsPollingId = setInterval(() => {
-                if (svSelectedId && svAutoScroll) pollNewEvents();
+                if (svSelectedId) pollNewEvents();
             }, SESSION_EVENTS_POLL);
         }
 
         // ═══════════════════════════════════════════════════════════════
         // Session List
         // ═══════════════════════════════════════════════════════════════
+        let fetchSessionListBusy = false;
         async function fetchSessionList() {
+            if (fetchSessionListBusy) return;
+            fetchSessionListBusy = true;
             const params = new URLSearchParams();
             const search = document.getElementById('sessionSearch').value;
             const project = document.getElementById('sessionProject').value;
@@ -2237,7 +2270,10 @@
             const dateFrom = document.getElementById('sessionDateFrom').value;
             const dateTo = document.getElementById('sessionDateTo').value;
 
-            if (search) params.set('search', search);
+            if (search) {
+                if (svSearchMode === 'content') params.set('content_q', search);
+                else params.set('search', search);
+            }
             if (project) params.set('project', project);
             if (status) params.set('status', status);
             if (source) params.set('source', source);
@@ -2261,6 +2297,8 @@
                 populateProjectFilter();
             } catch (err) {
                 console.error('Session list error:', err);
+            } finally {
+                fetchSessionListBusy = false;
             }
         }
 
@@ -2296,7 +2334,12 @@
                         (model ? '<span class="session-badge model">' + escapeHtml(model) + '</span>' : '') +
                         (s.subagentCount ? '<span class="session-badge subagents">' + s.subagentCount + ' sub</span>' : '') +
                         '<span class="session-time">' + timeAgo(s.mtime) + '</span>' +
-                        '</div></div>';
+                        '</div>' +
+                        ((s.duration || s.contextPct) ? '<div class="session-meta">' +
+                            (s.duration ? '<span class="session-badge duration">' + formatDuration(s.duration) + '</span>' : '') +
+                            (s.contextPct ? '<span class="session-badge ' + contextClass(s.contextPct) + '">' + s.contextPct + '% ctx</span>' : '') +
+                        '</div>' : '') +
+                        '</div>';
                 }).join('');
             }
 
@@ -2316,10 +2359,17 @@
             const project = document.getElementById('sessionProject').value;
             const status = document.getElementById('sessionStatus').value;
             const source = document.getElementById('sessionSource').value;
-            if (search) params.set('search', search);
+            if (search) {
+                if (svSearchMode === 'content') params.set('content_q', search);
+                else params.set('search', search);
+            }
             if (project) params.set('project', project);
             if (status) params.set('status', status);
             if (source) params.set('source', source);
+            const dateFrom = document.getElementById('sessionDateFrom').value;
+            const dateTo = document.getElementById('sessionDateTo').value;
+            if (dateFrom) params.set('date_from', dateFrom);
+            if (dateTo) params.set('date_to', dateTo);
             params.set('offset', String(svOffset));
             params.set('limit', '50');
 
@@ -2408,8 +2458,11 @@
             }
         }
 
+        let pollNewEventsBusy = false;
         async function pollNewEvents() {
+            if (pollNewEventsBusy) return;
             if (!svSelectedId) return;
+            pollNewEventsBusy = true;
             // Don't poll for ephemeral subagents (no session file)
             if (svViewingSubagent) {
                 const sa = svSubagents.find(s => s.id === svViewingSubagent);
@@ -2437,6 +2490,8 @@
                 }
             } catch (err) {
                 // Silent retry
+            } finally {
+                pollNewEventsBusy = false;
             }
         }
 
@@ -2475,8 +2530,8 @@
             const targetId = svViewingSubagent || svSelectedId;
 
             try {
-                // Fetch all events (larger limit)
-                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=5000');
+                // Fetch all events (full read from beginning)
+                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=10000&full=1');
                 if (!res.ok) throw new Error('Failed');
                 const data = await res.json();
                 const allEvents = data.events || [];
@@ -2551,6 +2606,60 @@
             btn.innerHTML = '&#x2B07; Export';
         }
 
+        async function copySession() {
+            if (!svSelectedId) return;
+            const btn = document.getElementById('copySessionBtn');
+            btn.disabled = true;
+            btn.textContent = 'Copying...';
+            const targetId = svViewingSubagent || svSelectedId;
+
+            try {
+                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=10000&full=1');
+                if (!res.ok) throw new Error('Failed');
+                const data = await res.json();
+                const allEvents = data.events || [];
+
+                let text = '';
+                for (const ev of allEvents) {
+                    if (ev.type === 'user') {
+                        if (ev.tool_results && ev.tool_results.length > 0) {
+                            for (const tr of ev.tool_results) {
+                                const status = tr.is_error ? 'ERROR' : 'OK';
+                                const content = (tr.content || '').trim();
+                                const summary = content.length > 200
+                                    ? content.slice(0, 200) + '...'
+                                    : content;
+                                text += '[RESULT ' + status + '] ' + summary + '\n\n';
+                            }
+                        } else if (ev.text && ev.userType === 'external') {
+                            text += 'USER: ' + ev.text.trim() + '\n\n';
+                        }
+                    } else if (ev.type === 'assistant') {
+                        if (ev.text) {
+                            text += 'ASSISTANT: ' + ev.text.trim() + '\n\n';
+                        }
+                        if (ev.tool_uses && ev.tool_uses.length > 0) {
+                            const names = ev.tool_uses.map(t => t.name).join(', ');
+                            text += '> tool: ' + names + '\n\n';
+                        }
+                    } else if (ev.type === 'system') {
+                        const sub = ev.subtype || 'system';
+                        text += '--- ' + sub + ' ---\n\n';
+                    }
+                }
+
+                await navigator.clipboard.writeText(text.trim());
+                btn.textContent = 'Copied!';
+                setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; }, 1500);
+            } catch (err) {
+                console.error('Copy error:', err);
+                btn.textContent = 'Failed';
+                setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; }, 1500);
+            }
+
+            btn.disabled = false;
+        }
+
         function updateConversationBadge() {
             const badge = document.getElementById('conversationBadge');
             if (svViewingSubagent) {
@@ -2561,6 +2670,7 @@
                 badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
             }
             document.getElementById('exportSessionBtn').style.display = svSelectedId ? '' : 'none';
+            document.getElementById('copySessionBtn').style.display = svSelectedId ? '' : 'none';
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -2607,6 +2717,13 @@
                 return;
             }
 
+            // Save open tool card states before re-render
+            const openCards = new Set();
+            viewer.querySelectorAll('.tool-card.open').forEach(el => {
+                if (el.id) openCards.add(el.id);
+            });
+            const prevScroll = viewer.scrollTop;
+
             let html = '';
 
             // Newest first
@@ -2618,8 +2735,16 @@
 
             viewer.innerHTML = html;
 
+            // Restore open tool card states after re-render
+            openCards.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.classList.add('open');
+            });
+
             if (autoScroll && svAutoScroll) {
                 viewer.scrollTop = 0;
+            } else if (openCards.size > 0) {
+                viewer.scrollTop = prevScroll;
             }
         }
 
@@ -3043,9 +3168,32 @@
         // ═══════════════════════════════════════════════════════════════
         // Filter Event Listeners
         // ═══════════════════════════════════════════════════════════════
+        function toggleSearchMode() {
+            svSearchMode = svSearchMode === 'name' ? 'content' : 'name';
+            const btn = document.getElementById('searchModeToggle');
+            const input = document.getElementById('sessionSearch');
+            if (svSearchMode === 'content') {
+                btn.innerHTML = '&#x1F4C4; Content';
+                btn.style.borderColor = '#39ff14';
+                btn.style.color = '#39ff14';
+                input.placeholder = 'Search in content...';
+                input.style.borderColor = '#39ff14';
+                btn.title = 'Switch to name search';
+            } else {
+                btn.innerHTML = '&#x1F50D; Name';
+                btn.style.borderColor = '#333';
+                btn.style.color = '#888';
+                input.placeholder = 'Search sessions...';
+                input.style.borderColor = '';
+                btn.title = 'Switch to content search';
+            }
+            if (input.value) fetchSessionList();
+        }
+
         document.getElementById('sessionSearch').addEventListener('input', () => {
             clearTimeout(svSearchTimer);
-            svSearchTimer = setTimeout(fetchSessionList, 300);
+            const delay = svSearchMode === 'content' ? 500 : 300;
+            svSearchTimer = setTimeout(fetchSessionList, delay);
         });
 
         document.getElementById('sessionProject').addEventListener('change', fetchSessionList);

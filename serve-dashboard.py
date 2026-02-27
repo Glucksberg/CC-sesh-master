@@ -27,6 +27,21 @@ HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
 
+MODEL_CONTEXT_WINDOWS = {
+    'opus-4': 200_000,
+    'sonnet-4': 200_000,
+    'haiku-4': 200_000,
+    'sonnet-3': 200_000,
+    'haiku-3': 200_000,
+    'opus-3': 200_000,
+    'o3': 200_000,
+    'o4-mini': 200_000,
+    'gpt-4.1': 1_047_576,
+    'gpt-4o': 128_000,
+    'gpt-5': 200_000,
+}
+MODEL_CONTEXT_DEFAULT = 200_000
+
 # Allowed origins for CORS (localhost only)
 ALLOWED_ORIGINS = {'http://localhost:37778', 'http://127.0.0.1:37778', 'null'}
 
@@ -164,6 +179,16 @@ class SessionIndex:
             # Count inline subagents (OpenClaw sessions_spawn)
             inline_count = meta.get('inline_subagent_count', 0)
 
+            # Duration
+            first_ts = meta.get('first_ts')
+            duration = int(mtime - first_ts) if first_ts else 0
+
+            # Context %
+            last_input = meta.get('last_input_tokens', 0)
+            model = meta.get('model', '')
+            ctx_size = self._get_context_size(model)
+            context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
             sessions[sid] = {
                 'sessionId': sid,
                 'project': display,
@@ -178,10 +203,23 @@ class SessionIndex:
                 'cwd': meta.get('cwd', ''),
                 'gitBranch': meta.get('gitBranch', ''),
                 'subagentCount': len(sub_list) + inline_count,
+                'duration': duration,
+                'contextPct': context_pct,
                 '_path': str(jsonl_file),
             }
 
     # ── metadata helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_context_size(model):
+        """Get context window size for a model via substring match."""
+        if not model:
+            return MODEL_CONTEXT_DEFAULT
+        m = model.lower()
+        for key, size in MODEL_CONTEXT_WINDOWS.items():
+            if key in m:
+                return size
+        return MODEL_CONTEXT_DEFAULT
 
     @staticmethod
     def _extract_metadata(path, size):
@@ -200,6 +238,19 @@ class SessionIndex:
                     try:
                         obj = json.loads(line)
                         t = obj.get('type', '')
+
+                        # Capture first timestamp
+                        if 'first_ts' not in meta:
+                            ts = obj.get('timestamp')
+                            if ts:
+                                if isinstance(ts, str):
+                                    try:
+                                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        meta['first_ts'] = dt.timestamp()
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif isinstance(ts, (int, float)):
+                                    meta['first_ts'] = ts / 1000 if ts > 1e12 else ts
 
                         # Claude Code native format
                         if not meta.get('slug'):
@@ -253,6 +304,26 @@ class SessionIndex:
                         t = obj.get('type', '')
                         if t == 'system' and obj.get('subtype') == 'stop_hook_summary':
                             meta['has_stop'] = True
+
+                        # Capture last input_tokens from assistant messages
+                        # Total context = input_tokens + cache_read + cache_creation
+                        if 'last_input_tokens' not in meta:
+                            usage = None
+                            if t == 'assistant':
+                                usage = obj.get('message', {}).get('usage', {})
+                            elif t == 'message':
+                                msg = obj.get('message', {})
+                                if msg.get('role') == 'assistant':
+                                    usage = msg.get('usage', {})
+                            if usage and isinstance(usage, dict):
+                                it = (usage.get('input_tokens', 0)
+                                      + usage.get('cache_read_input_tokens', 0)
+                                      + usage.get('cache_creation_input_tokens', 0)
+                                      + usage.get('cacheRead', 0)
+                                      + usage.get('cacheWrite', 0))
+                                if it:
+                                    meta['last_input_tokens'] = it
+
                         if not meta.get('model'):
                             if t == 'assistant':
                                 meta['model'] = obj.get('message', {}).get('model', '')
@@ -264,7 +335,10 @@ class SessionIndex:
                                         meta['model'] = model
                         if not meta.get('slug') and obj.get('slug'):
                             meta['slug'] = obj['slug']
-                        break
+
+                        # Stop once we have input_tokens (or model as fallback)
+                        if 'last_input_tokens' in meta and (meta.get('model') or meta.get('slug')):
+                            break
                     except (json.JSONDecodeError, KeyError):
                         pass
 
@@ -375,6 +449,16 @@ class SessionIndex:
             age = time.time() - mtime
             active = age < 120 and not meta.get('has_complete', False)
 
+            # Duration
+            first_ts = meta.get('first_ts')
+            duration = int(mtime - first_ts) if first_ts else 0
+
+            # Context %
+            last_input = meta.get('last_input_tokens', 0)
+            model = meta.get('model', '')
+            ctx_size = self._get_context_size(model)
+            context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
             sessions[sid] = {
                 'sessionId': sid,
                 'project': display,
@@ -389,6 +473,8 @@ class SessionIndex:
                 'cwd': cwd,
                 'gitBranch': meta.get('gitBranch', ''),
                 'subagentCount': 0,
+                'duration': duration,
+                'contextPct': context_pct,
                 '_path': str(jsonl_file),
             }
 
@@ -411,6 +497,19 @@ class SessionIndex:
                         payload = obj.get('payload', {})
                         if not isinstance(payload, dict):
                             continue
+
+                        # Capture first timestamp
+                        if 'first_ts' not in meta:
+                            ts = raw_ts = obj.get('timestamp', '')
+                            if ts:
+                                if isinstance(ts, str):
+                                    try:
+                                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        meta['first_ts'] = dt.timestamp()
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif isinstance(ts, (int, float)):
+                                    meta['first_ts'] = ts / 1000 if ts > 1e12 else ts
 
                         if t == 'session_meta':
                             meta['id'] = payload.get('id', '')
@@ -483,11 +582,82 @@ class SessionIndex:
 
         return meta
 
+    # ── content search via ripgrep ────────────────────────────────────────
+
+    _content_cache = {}  # class-level: {cache_key: {'ids': set, 'time': float}}
+    _CONTENT_CACHE_TTL = 60
+
+    def content_search(self, query, source=None):
+        """Search session file contents using ripgrep. Returns set of session IDs."""
+        if not query or len(query) < 2 or len(query) > 100:
+            return set()
+
+        # Strip control characters (null bytes, etc)
+        query = re.sub(r'[\x00-\x1f]', '', query)
+        if len(query) < 2:
+            return set()
+
+        cache_key = (query, source)
+        cached = self._content_cache.get(cache_key)
+        if cached and time.time() - cached['time'] < self._CONTENT_CACHE_TTL:
+            return cached['ids']
+
+        # Evict stale entries if cache grows large
+        now = time.time()
+        if len(self._content_cache) > 200:
+            self._content_cache = {
+                k: v for k, v in self._content_cache.items()
+                if now - v['time'] < self._CONTENT_CACHE_TTL
+            }
+
+        # Build search directories based on source filter
+        dirs = []
+        if source in (None, 'claude') and PROJECTS_DIR.exists():
+            dirs.append(str(PROJECTS_DIR))
+        if source in (None, 'openclaw') and OPENCLAW_DIR.exists():
+            dirs.append(str(OPENCLAW_DIR))
+        if source in (None, 'codex') and CODEX_DIR.exists():
+            dirs.append(str(CODEX_DIR))
+
+        if not dirs:
+            return set()
+
+        cmd = [
+            'rg', '-l', '--fixed-strings', '--max-filesize', '50M',
+            '--glob', '*.jsonl',
+            '--glob', '!*openclaw-workspace*', '--glob', '!*observer*',
+            query,
+        ] + dirs
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+            )
+            paths = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        except (subprocess.TimeoutExpired, OSError):
+            return set()
+
+        # Map file paths back to session IDs via reverse lookup
+        with self._lock:
+            path_to_id = {s['_path']: sid for sid, s in self._sessions.items()}
+
+        matched_ids = set()
+        for p in paths:
+            p = p.strip()
+            if not p:
+                continue
+            sid = path_to_id.get(p)
+            if sid:
+                matched_ids.add(sid)
+
+        self._content_cache[cache_key] = {'ids': matched_ids, 'time': time.time()}
+        return matched_ids
+
     # ── query interface ───────────────────────────────────────────────────
 
     def get_sessions(self, project=None, status=None, search=None,
                      date_from=None, date_to=None, sort='mtime',
-                     offset=0, limit=50, source=None):
+                     offset=0, limit=50, source=None, content_q=None):
         self.ensure_fresh()
 
         with self._lock:
@@ -509,6 +679,9 @@ class SessionIndex:
                         if q in s.get('slug', '').lower()
                         or q in s.get('project', '').lower()
                         or q in s.get('sessionId', '').lower()]
+        if content_q and len(content_q) >= 2:
+            matched_ids = self.content_search(content_q, source)
+            sessions = [s for s in sessions if s['sessionId'] in matched_ids]
         if date_from:
             try:
                 ts = datetime.strptime(date_from, '%Y-%m-%d').timestamp()
@@ -588,7 +761,7 @@ class SessionEventReader:
         return str(path).startswith(str(CODEX_DIR))
 
     @classmethod
-    def read_events(cls, path, after=None, limit=100, types=None):
+    def read_events(cls, path, after=None, limit=100, types=None, full=False):
         events = []
         try:
             file_size = os.path.getsize(path)
@@ -597,11 +770,27 @@ class SessionEventReader:
                 events = cls._read_codex_events(path, file_size, after, limit, types)
             elif after:
                 events = cls._read_after_cursor(path, file_size, after, limit, types)
+            elif full:
+                events = cls._read_full(path, limit, types)
             else:
                 events = cls._read_tail(path, file_size, limit, types)
         except OSError as e:
             print(f"Error reading session: {e}", file=sys.stderr)
 
+        return events
+
+    @classmethod
+    def _read_full(cls, path, limit, types):
+        """Read all events from beginning of file (for export/copy)."""
+        events = []
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                ev = cls._parse_event(line.strip())
+                if ev and ev['type'] not in cls._SKIP_TYPES:
+                    if not types or ev['type'] in types:
+                        events.append(ev)
+                        if len(events) >= limit:
+                            break
         return events
 
     @classmethod
@@ -803,7 +992,9 @@ class SessionEventReader:
                 # Skip system-injected context
                 if texts and (texts[0].startswith('# AGENTS.md')
                               or texts[0].startswith('# Collaboration Mode')
-                              or texts[0].startswith('<environment_context>')):
+                              or texts[0].startswith('<environment_context>')
+                              or texts[0].startswith('<permissions')
+                              or texts[0].startswith('<collaboration_mode')):
                     return None
                 if not texts:
                     return None
@@ -839,6 +1030,10 @@ class SessionEventReader:
                 if texts:
                     result['text'] = '\n'.join(texts)
                 return result
+
+            # Reasoning (thinking) — skip display, already covered by agent_reasoning event_msg
+            if pt == 'reasoning':
+                return None
 
             # Function call
             if pt == 'function_call':
@@ -1558,6 +1753,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 offset=int(qs.get('offset', ['0'])[0]),
                 limit=min(int(qs.get('limit', ['50'])[0]), 200),
                 source=qs.get('source', [None])[0],
+                content_q=qs.get('content_q', [None])[0],
             )
             self.send_json(data)
         except Exception as e:
@@ -1571,12 +1767,13 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             after = qs.get('after', [None])[0]
-            limit = min(int(qs.get('limit', ['100'])[0]), 500)
+            full = qs.get('full', [''])[0] == '1'
+            limit = min(int(qs.get('limit', ['100'])[0]), 10000 if full else 500)
             types_raw = qs.get('types', [None])[0]
             types = set(types_raw.split(',')) if types_raw else None
 
             events = SessionEventReader.read_events(
-                path, after=after, limit=limit, types=types,
+                path, after=after, limit=limit, types=types, full=full,
             )
             self.send_json({'events': events, 'sessionId': session_id})
         except Exception as e:
