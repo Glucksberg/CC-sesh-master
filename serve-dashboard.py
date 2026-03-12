@@ -26,6 +26,8 @@ PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
+_kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
+KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 
 MODEL_CONTEXT_WINDOWS = {
     'opus-4': 200_000,
@@ -39,6 +41,8 @@ MODEL_CONTEXT_WINDOWS = {
     'gpt-4.1': 1_047_576,
     'gpt-4o': 128_000,
     'gpt-5': 200_000,
+    'kimi-k2.5': 131_072,
+    'moonshot': 131_072,
 }
 MODEL_CONTEXT_DEFAULT = 200_000
 
@@ -125,6 +129,10 @@ class SessionIndex:
         # ── Scan ~/.codex/sessions/ ──────────────────────────────────
         if CODEX_DIR.exists():
             self._scan_codex_sessions(CODEX_DIR, sessions, projects)
+
+        # ── Scan ~/.kimi/sessions/ ───────────────────────────────────
+        if KIMI_DIR.exists():
+            self._scan_kimi_sessions(KIMI_DIR, sessions, projects)
 
         with self._lock:
             self._sessions = sessions
@@ -517,11 +525,18 @@ class SessionIndex:
                                     meta['first_ts'] = ts / 1000 if ts > 1e12 else ts
 
                         if t == 'session_meta':
-                            meta['id'] = payload.get('id', '')
-                            meta['cwd'] = payload.get('cwd', '')
-                            meta['version'] = payload.get('cli_version', '')
+                            # Only use the FIRST session_meta's id — subagent
+                            # files may include the parent's session_meta as
+                            # line 1, which would overwrite the subagent's own
+                            # id and cause the parent session to be shadowed.
+                            if 'id' not in meta:
+                                meta['id'] = payload.get('id', '')
+                            if not meta.get('cwd'):
+                                meta['cwd'] = payload.get('cwd', '')
+                            if not meta.get('version'):
+                                meta['version'] = payload.get('cli_version', '')
                             git = payload.get('git', {})
-                            if isinstance(git, dict):
+                            if isinstance(git, dict) and not meta.get('gitBranch'):
                                 meta['gitBranch'] = git.get('branch', '')
 
                         elif t == 'turn_context':
@@ -590,6 +605,177 @@ class SessionIndex:
 
         return meta
 
+    # ── Kimi session scanning ─────────────────────────────────────────────
+
+    def _scan_kimi_sessions(self, base_dir, sessions, projects):
+        """Scan ~/.kimi/sessions/{workdir_md5}/{session_id}/ for wire.jsonl files."""
+        if not base_dir.exists():
+            return
+        for hash_dir in base_dir.iterdir():
+            if not hash_dir.is_dir():
+                continue
+            for sess_dir in hash_dir.iterdir():
+                if not sess_dir.is_dir():
+                    continue
+                wire_path = sess_dir / 'wire.jsonl'
+                if not wire_path.exists():
+                    continue
+                try:
+                    st = wire_path.stat()
+                    mtime = st.st_mtime
+                    size = st.st_size
+                except OSError:
+                    continue
+                if size == 0:
+                    continue
+
+                meta = self._extract_kimi_metadata(sess_dir, size)
+                if meta is None:
+                    continue
+
+                sid = 'kimi-' + sess_dir.name
+                cwd = meta.get('cwd', '')
+                home_prefix = str(Path.home()) + '/'
+                rel = cwd.replace(home_prefix, '').rstrip('/') if cwd else ''
+                display = 'kimi/' + rel if rel else 'kimi/' + hash_dir.name
+                projects.add(display)
+
+                age = time.time() - mtime
+                active = age < 120 and not meta.get('has_turn_end', False)
+
+                first_ts = meta.get('first_ts')
+                duration = int(mtime - first_ts) if first_ts else 0
+
+                last_input = meta.get('last_input_tokens', 0)
+                model = meta.get('model', '')
+                ctx_size = self._get_context_size(model)
+                context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
+                sessions[sid] = {
+                    'sessionId': sid,
+                    'project': display,
+                    'source': 'kimi',
+                    'slug': meta.get('slug', ''),
+                    'status': 'active' if active else 'completed',
+                    'model': model,
+                    'version': meta.get('version', ''),
+                    'mtime': mtime,
+                    'size': size,
+                    'eventCount': meta.get('event_count', 0),
+                    'cwd': cwd,
+                    'gitBranch': meta.get('gitBranch', ''),
+                    'subagentCount': 0,
+                    'duration': duration,
+                    'contextPct': context_pct,
+                    '_path': str(wire_path),
+                }
+
+    @staticmethod
+    def _extract_kimi_metadata(sess_dir, wire_size):
+        """Extract metadata from a Kimi session directory (wire.jsonl + context.jsonl)."""
+        meta = {'event_count': max(1, wire_size // 500)}
+        wire_path = sess_dir / 'wire.jsonl'
+        context_path = sess_dir / 'context.jsonl'
+
+        try:
+            # Head scan wire.jsonl for TurnBegin (model)
+            with open(wire_path, 'r', errors='replace') as f:
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        t = obj.get('type', '')
+
+                        if 'first_ts' not in meta:
+                            ts = obj.get('timestamp')
+                            if ts:
+                                if isinstance(ts, str):
+                                    try:
+                                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        meta['first_ts'] = dt.timestamp()
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif isinstance(ts, (int, float)):
+                                    meta['first_ts'] = ts / 1000 if ts > 1e12 else ts
+
+                        if t == 'TurnBegin' and not meta.get('model'):
+                            meta['model'] = obj.get('model', '') or (obj.get('payload') or {}).get('model', '')
+                        if t == 'TurnBegin' and not meta.get('version'):
+                            meta['version'] = obj.get('version', '') or (obj.get('payload') or {}).get('version', '')
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                # Tail scan wire.jsonl for TurnEnd
+                seek_back = min(wire_size, 8192)
+                f.seek(max(0, wire_size - seek_back))
+                if wire_size > seek_back:
+                    f.readline()
+                tail = f.read()
+
+                for line in reversed(tail.strip().split('\n')):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        t = obj.get('type', '')
+                        if t == 'TurnEnd':
+                            meta['has_turn_end'] = True
+                            usage = obj.get('usage') or (obj.get('payload') or {}).get('usage', {})
+                            if usage and isinstance(usage, dict):
+                                it = (usage.get('input_tokens', 0)
+                                      + usage.get('cache_read_input_tokens', 0)
+                                      + usage.get('cache_creation_input_tokens', 0))
+                                if it and 'last_input_tokens' not in meta:
+                                    meta['last_input_tokens'] = it
+                        if not meta.get('_tail_model') and t == 'TurnBegin':
+                            m = obj.get('model', '') or (obj.get('payload') or {}).get('model', '')
+                            if m:
+                                meta['model'] = m
+                                meta['_tail_model'] = True
+                        if meta.get('has_turn_end') and meta.get('model'):
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+            # Head scan context.jsonl for cwd, first user prompt (slug)
+            if context_path.exists():
+                with open(context_path, 'r', errors='replace') as f:
+                    for _ in range(10):
+                        line = f.readline()
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if not meta.get('cwd') and obj.get('cwd'):
+                                meta['cwd'] = obj['cwd']
+                            if not meta.get('gitBranch') and obj.get('gitBranch'):
+                                meta['gitBranch'] = obj['gitBranch']
+                            if not meta.get('slug'):
+                                role = obj.get('role', '')
+                                if role == 'user':
+                                    content = obj.get('content', '')
+                                    if isinstance(content, str) and content:
+                                        if (len(content) <= 500
+                                                and not content.startswith('#')
+                                                and not content.startswith('<')):
+                                            meta['slug'] = content[:80].replace('\n', ' ').strip()
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+        except OSError:
+            return None
+
+        return meta
+
     # ── content search via ripgrep ────────────────────────────────────────
 
     _content_cache = {}  # class-level: {cache_key: {'ids': set, 'time': float}}
@@ -626,6 +812,8 @@ class SessionIndex:
             dirs.append(str(OPENCLAW_DIR))
         if source in (None, 'codex') and CODEX_DIR.exists():
             dirs.append(str(CODEX_DIR))
+        if source in (None, 'kimi') and KIMI_DIR.exists():
+            dirs.append(str(KIMI_DIR))
 
         if not dirs:
             return set()
@@ -675,7 +863,7 @@ class SessionIndex:
         # Collect available sources
         sources = sorted(set(s.get('source', 'claude') for s in sessions))
 
-        if source and source in ('claude', 'openclaw', 'codex'):
+        if source and source in ('claude', 'openclaw', 'codex', 'kimi'):
             sessions = [s for s in sessions if s.get('source') == source]
         if project:
             sessions = [s for s in sessions if s['project'] == project]
@@ -768,6 +956,11 @@ class SessionEventReader:
         """Check if path is under the Codex sessions directory."""
         return str(path).startswith(str(CODEX_DIR))
 
+    @staticmethod
+    def _is_kimi_path(path):
+        """Check if path is under the Kimi sessions directory."""
+        return str(path).startswith(str(KIMI_DIR))
+
     @classmethod
     def read_events(cls, path, after=None, limit=100, types=None, full=False):
         events = []
@@ -776,6 +969,8 @@ class SessionEventReader:
 
             if cls._is_codex_path(path):
                 events = cls._read_codex_events(path, file_size, after, limit, types)
+            elif cls._is_kimi_path(path):
+                events = cls._read_kimi_events(path, file_size, after, limit, types)
             elif after:
                 events = cls._read_after_cursor(path, file_size, after, limit, types)
             elif full:
@@ -1147,6 +1342,142 @@ class SessionEventReader:
 
         return None
 
+    # ── Kimi event reading ────────────────────────────────────────────────
+
+    @classmethod
+    def _read_kimi_events(cls, path, file_size, after=None, limit=100, types=None):
+        """Read events from a Kimi wire.jsonl file using line-number cursors."""
+        events = []
+
+        if after and after.startswith('kimi-'):
+            try:
+                after_line = int(after[5:])
+            except (ValueError, IndexError):
+                return events
+
+            if after_line < 0:
+                return events
+
+            found = False
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if not found:
+                        if line_num == after_line:
+                            found = True
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                        if len(events) >= limit:
+                            break
+            return events
+
+        # For large files, tail-read to avoid loading entire file
+        if file_size > TAIL_READ_BYTES:
+            with open(path, 'rb') as f:
+                seek_back = min(file_size, TAIL_READ_BYTES)
+                f.seek(max(0, file_size - seek_back))
+                if file_size > seek_back:
+                    f.readline()  # skip partial line
+                tail = f.read().decode('utf-8', errors='replace')
+            est_start = max(0, round((file_size - TAIL_READ_BYTES) / 200))
+            for i, line in enumerate(tail.split('\n')):
+                line = line.strip()
+                if not line:
+                    continue
+                ev = cls._parse_kimi_event(line, est_start + i)
+                if ev and ev['type'] not in cls._SKIP_TYPES:
+                    if not types or ev['type'] in types:
+                        events.append(ev)
+            return events[-limit:]
+
+        # Full scan for small files
+        with open(path, 'r', errors='replace') as f:
+            for line_num, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                ev = cls._parse_kimi_event(line, line_num)
+                if ev and ev['type'] not in cls._SKIP_TYPES:
+                    if not types or ev['type'] in types:
+                        events.append(ev)
+        return events[-limit:]
+
+    @staticmethod
+    def _parse_kimi_event(line, line_num=0):
+        """Parse a Kimi wire.jsonl line into the unified event format."""
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        t = raw.get('type', '')
+        ts = raw.get('timestamp', '')
+        uuid = f'kimi-{line_num}'
+
+        if t == 'TurnBegin':
+            return {
+                'type': 'system', 'uuid': uuid, 'timestamp': ts,
+                'subtype': 'turn_begin', 'level': '',
+                'model': raw.get('model', '') or (raw.get('payload') or {}).get('model', ''),
+            }
+        if t == 'TurnEnd':
+            return {
+                'type': 'system', 'uuid': uuid, 'timestamp': ts,
+                'subtype': 'turn_end', 'level': '',
+                'usage': raw.get('usage') or (raw.get('payload') or {}).get('usage'),
+            }
+        if t == 'StepBegin':
+            return None
+        if t == 'ContentPart':
+            text = raw.get('text', '') or raw.get('content', '') or (raw.get('payload') or {}).get('text', '')
+            if not text:
+                return None
+            return {
+                'type': 'assistant', 'uuid': uuid, 'timestamp': ts,
+                'model': '', 'usage': {}, 'stop_reason': '',
+                'text': text[:MAX_TEXT_LEN],
+                'truncated': len(text) > MAX_TEXT_LEN,
+            }
+        if t == 'ToolCall':
+            name = raw.get('name', '') or (raw.get('payload') or {}).get('name', '')
+            args = raw.get('arguments') or raw.get('input') or (raw.get('payload') or {}).get('arguments', {})
+            inp = json.dumps(args) if not isinstance(args, str) else args
+            return {
+                'type': 'assistant', 'uuid': uuid, 'timestamp': ts,
+                'model': '', 'usage': {}, 'stop_reason': '',
+                'tool_uses': [{
+                    'type': 'tool_use',
+                    'id': raw.get('id', uuid),
+                    'name': name,
+                    'input': inp[:MAX_TOOL_INPUT_LEN],
+                    'truncated': len(inp) > MAX_TOOL_INPUT_LEN,
+                }],
+            }
+        if t == 'ToolResult':
+            raw_output = raw.get('output', '') or raw.get('content', '') or (raw.get('payload') or {}).get('output', '')
+            output = raw_output if isinstance(raw_output, str) else json.dumps(raw_output)
+            is_error = raw.get('is_error', False) or (raw.get('payload') or {}).get('is_error', False)
+            result = {
+                'type': 'user', 'uuid': uuid, 'timestamp': ts,
+                'userType': 'tool_result',
+                'tool_results': [{
+                    'tool_use_id': raw.get('tool_call_id', '') or raw.get('id', ''),
+                    'type': 'tool_result',
+                    'content': output[:MAX_TOOL_RESULT_LEN],
+                    'truncated': len(output) > MAX_TOOL_RESULT_LEN,
+                }],
+            }
+            if is_error:
+                result['tool_results'][0]['is_error'] = True
+            return result
+
+        return None
+
     # ── single-event parsing ──────────────────────────────────────────────
 
     @staticmethod
@@ -1464,17 +1795,18 @@ class SessionEventReader:
     @staticmethod
     def get_raw_event(path, event_uuid):
         try:
-            # Codex: line-number based lookup
-            if event_uuid.startswith('codex-'):
-                try:
-                    target_line = int(event_uuid.split('-', 1)[1])
-                except (ValueError, IndexError):
+            # Codex/Kimi: line-number based lookup
+            for prefix in ('codex-', 'kimi-'):
+                if event_uuid.startswith(prefix):
+                    try:
+                        target_line = int(event_uuid[len(prefix):])
+                    except (ValueError, IndexError):
+                        return None
+                    with open(path, 'r', errors='replace') as f:
+                        for i, line in enumerate(f):
+                            if i == target_line:
+                                return json.loads(line.strip())
                     return None
-                with open(path, 'r', errors='replace') as f:
-                    for i, line in enumerate(f):
-                        if i == target_line:
-                            return json.loads(line.strip())
-                return None
 
             size = os.path.getsize(path)
             # Try tail first
@@ -1645,6 +1977,25 @@ class SessionEventReader:
                                 stats['tool_calls'][name] = (
                                     stats['tool_calls'].get(name, 0) + 1
                                 )
+
+                    # Kimi format
+                    elif et == 'TurnBegin':
+                        if not stats['model']:
+                            stats['model'] = raw.get('model', '') or (raw.get('payload') or {}).get('model', '')
+                        if not stats['version']:
+                            stats['version'] = raw.get('version', '')
+                    elif et == 'TurnEnd':
+                        # Kimi TurnEnd reports per-turn token usage (additive across turns)
+                        usage = raw.get('usage') or (raw.get('payload') or {}).get('usage', {})
+                        if isinstance(usage, dict):
+                            stats['tokens']['input'] += usage.get('input_tokens', 0)
+                            stats['tokens']['output'] += usage.get('output_tokens', 0)
+                            stats['tokens']['cache_read'] += usage.get('cache_read_input_tokens', 0)
+                            stats['tokens']['cache_creation'] += usage.get('cache_creation_input_tokens', 0)
+                    elif et == 'ToolCall':
+                        name = raw.get('name', '') or (raw.get('payload') or {}).get('name', 'unknown')
+                        stats['tool_calls'][name] = stats['tool_calls'].get(name, 0) + 1
+
         except OSError as e:
             print(f"Error reading stats: {e}", file=sys.stderr)
 

@@ -29,6 +29,7 @@
             --state-color: #3b82f6;
             --mem-color: #a855f7;
             --progress-color: #06b6d4;
+            --kimi-color: #8a2be2;
 
             --scanline-opacity: 0.03;
             --glow-intensity: 0.6;
@@ -953,6 +954,11 @@
             color: var(--anomaly-color);
         }
 
+        .session-badge.source-kimi {
+            background: rgba(138, 43, 226, 0.15);
+            color: var(--kimi-color);
+        }
+
         .session-status-dot {
             width: 6px;
             height: 6px;
@@ -1763,6 +1769,7 @@
                                     <option value="claude">Claude Code</option>
                                     <option value="openclaw">OpenClaw</option>
                                     <option value="codex">Codex CLI</option>
+                                    <option value="kimi">Kimi Code</option>
                                 </select>
                             </div>
                             <div class="filter-row">
@@ -2324,7 +2331,7 @@
                     const proj = escapeHtml(s.project || '');
                     const model = shortModel(s.model);
                     const src = s.source || 'claude';
-                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex'}[src] || src;
+                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex', kimi: 'Kimi'}[src] || src;
                     return '<div class="session-item' + sel + active + '" data-id="' + escapeHtml(s.sessionId) + '" onclick="selectSession(\'' + escapeHtml(s.sessionId) + '\')">' +
                         '<div class="session-slug">' + slug + '</div>' +
                         '<div class="session-meta">' +
