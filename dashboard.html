@@ -2287,7 +2287,7 @@
             if (dateFrom) params.set('date_from', dateFrom);
             if (dateTo) params.set('date_to', dateTo);
             params.set('offset', '0');
-            params.set('limit', '50');
+            params.set('limit', String(Math.max(50, svOffset || 50)));
 
             try {
                 const res = await fetch(SESSION_API + '/list?' + params.toString());
