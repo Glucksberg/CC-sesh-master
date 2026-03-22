@@ -2266,8 +2266,9 @@
         // Session List
         // ═══════════════════════════════════════════════════════════════
         let fetchSessionListBusy = false;
+        let loadMoreInProgress = false;
         async function fetchSessionList() {
-            if (fetchSessionListBusy) return;
+            if (fetchSessionListBusy || loadMoreInProgress) return;
             fetchSessionListBusy = true;
             const params = new URLSearchParams();
             const search = document.getElementById('sessionSearch').value;
@@ -2360,6 +2361,7 @@
             const btn = document.getElementById('loadMoreSessions');
             btn.disabled = true;
             btn.textContent = 'Loading...';
+            loadMoreInProgress = true;
 
             const params = new URLSearchParams();
             const search = document.getElementById('sessionSearch').value;
@@ -2383,13 +2385,18 @@
             try {
                 const res = await fetch(SESSION_API + '/list?' + params.toString());
                 const data = await res.json();
-                svSessions = svSessions.concat(data.sessions || []);
+                const newSessions = data.sessions || [];
+                // Deduplicate by sessionId to avoid race conditions with polling
+                const existingIds = new Set(svSessions.map(s => s.sessionId));
+                const unique = newSessions.filter(s => !existingIds.has(s.sessionId));
+                svSessions = svSessions.concat(unique);
                 svOffset = svSessions.length;
                 renderSessionList();
             } catch (err) {
                 console.error('Load more error:', err);
             }
 
+            loadMoreInProgress = false;
             btn.disabled = false;
             btn.textContent = 'Load More';
         }
