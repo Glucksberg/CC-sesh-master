@@ -30,6 +30,7 @@
             --mem-color: #a855f7;
             --progress-color: #06b6d4;
             --kimi-color: #8a2be2;
+            --droid-color: #e74c3c;
 
             --scanline-opacity: 0.03;
             --glow-intensity: 0.6;
@@ -959,6 +960,11 @@
             color: var(--kimi-color);
         }
 
+        .session-badge.source-droid {
+            background: rgba(231, 76, 60, 0.15);
+            color: var(--droid-color);
+        }
+
         .session-status-dot {
             width: 6px;
             height: 6px;
@@ -1630,9 +1636,10 @@
                 <div class="stat-card">
                     <div class="stat-header">
                         <div class="stat-icon">&#x25A3;</div>
-                        <span class="stat-label">Total Memory</span>
+                        <span class="stat-label">System Memory</span>
                     </div>
-                    <div class="stat-value"><span id="statMemory">0</span><span class="stat-unit">MB</span></div>
+                    <div class="stat-value"><span id="statSysMem">0</span><span class="stat-unit">GB</span></div>
+                    <div class="stat-sub" style="font-size:11px;color:#8892b0;margin-top:2px;">Claude: <span id="statMemory">0</span> MB</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-header">
@@ -1770,6 +1777,7 @@
                                     <option value="openclaw">OpenClaw</option>
                                     <option value="codex">Codex CLI</option>
                                     <option value="kimi">Kimi Code</option>
+                                    <option value="droid">Droid</option>
                                 </select>
                             </div>
                             <div class="filter-row">
@@ -1981,6 +1989,7 @@
         const clock = document.getElementById('clock');
         const statProcesses = document.getElementById('statProcesses');
         const statMemory = document.getElementById('statMemory');
+        const statSysMem = document.getElementById('statSysMem');
         const statMcp = document.getElementById('statMcp');
         const statAnomalies = document.getElementById('statAnomalies');
         const anomalyCard = document.getElementById('anomalyCard');
@@ -2161,6 +2170,8 @@
                 const counts = parseCounts(data.counts);
                 statProcesses.textContent = counts.claude || 0;
                 statMemory.textContent = data.total_mem_mb || 0;
+                const sysUsedGb = data.system_used_mb ? (data.system_used_mb / 1024).toFixed(1) : '0';
+                statSysMem.textContent = sysUsedGb;
                 statMcp.textContent = counts.mcp || 0;
                 const anomalies = data.anomaly_count || 0;
                 statAnomalies.textContent = anomalies;
@@ -2332,7 +2343,7 @@
                     const proj = escapeHtml(s.project || '');
                     const model = shortModel(s.model);
                     const src = s.source || 'claude';
-                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex', kimi: 'Kimi'}[src] || src;
+                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex', kimi: 'Kimi', droid: 'Droid'}[src] || src;
                     return '<div class="session-item' + sel + active + '" data-id="' + escapeHtml(s.sessionId) + '" onclick="selectSession(\'' + escapeHtml(s.sessionId) + '\')">' +
                         '<div class="session-slug">' + slug + '</div>' +
                         '<div class="session-meta">' +

@@ -21,6 +21,84 @@ import re
 PORT = 37778
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOG_DIR = SCRIPT_DIR / "logs"
+
+# ─── Process State Tracker (shared across requests) ─────────────────────────
+_previous_pids = {}   # pid -> {type, memory, cmdline}
+_tracker_lock = threading.Lock()
+
+
+def _write_event(event_dict):
+    """Append an event to today's event log file."""
+    today = datetime.now().strftime('%Y%m%d')
+    event_file = LOG_DIR / f'events_{today}.jsonl'
+    try:
+        with open(event_file, 'a') as f:
+            f.write(json.dumps(event_dict) + '\n')
+    except (OSError, IOError) as e:
+        print(f"Warning: Could not write event: {e}", file=sys.stderr)
+
+
+def _detect_and_log_events(current_processes, total_mem):
+    """Compare current processes with previous state, log SPAWN/EXIT events."""
+    global _previous_pids
+    now = datetime.now().isoformat()
+
+    current_pids = {}
+    for p in current_processes:
+        current_pids[p['pid']] = {
+            'type': p.get('type', 'unknown'),
+            'memory': p.get('memory', 0),
+        }
+
+    new_events = []
+
+    with _tracker_lock:
+        prev = _previous_pids
+
+        # Detect SPAWNs (pids in current but not in previous)
+        for pid, info in current_pids.items():
+            if pid not in prev:
+                ev = {
+                    'ts': now,
+                    'event': 'SPAWN',
+                    'pid': str(pid),
+                    'details': info['type'],
+                    'total_mem_mb': total_mem,
+                }
+                new_events.append(ev)
+
+        # Detect EXITs (pids in previous but not in current)
+        for pid, info in prev.items():
+            if pid not in current_pids:
+                ev = {
+                    'ts': now,
+                    'event': 'EXIT',
+                    'pid': str(pid),
+                    'details': info['type'],
+                    'total_mem_mb': total_mem,
+                }
+                new_events.append(ev)
+
+        # Detect memory anomalies (any single process > 2GB)
+        for pid, info in current_pids.items():
+            if info['memory'] > 2048:
+                prev_mem = prev.get(pid, {}).get('memory', 0)
+                if prev_mem <= 2048:
+                    ev = {
+                        'ts': now,
+                        'event': 'ANOMALY_MEM',
+                        'pid': str(pid),
+                        'details': f"{info['type']} using {info['memory']}MB",
+                        'total_mem_mb': total_mem,
+                    }
+                    new_events.append(ev)
+
+        _previous_pids = current_pids
+
+    for ev in new_events:
+        _write_event(ev)
+
+    return new_events
 CLAUDE_DIR = Path.home() / '.claude'
 PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
@@ -28,6 +106,7 @@ OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
 _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
+DROID_DIR = Path.home() / '.factory' / 'sessions'
 
 MODEL_CONTEXT_WINDOWS = {
     'opus-4': 200_000,
@@ -133,6 +212,10 @@ class SessionIndex:
         # ── Scan ~/.kimi/sessions/ ───────────────────────────────────
         if KIMI_DIR.exists():
             self._scan_kimi_sessions(KIMI_DIR, sessions, projects)
+
+        # ── Scan ~/.factory/sessions/ (Droid) ─────────────────────────
+        if DROID_DIR.exists():
+            self._scan_droid_sessions(DROID_DIR, sessions, projects)
 
         with self._lock:
             self._sessions = sessions
@@ -776,6 +859,193 @@ class SessionIndex:
 
         return meta
 
+    # ── Droid session scanning (.factory/sessions) ──────────────────────
+
+    def _scan_droid_sessions(self, base_dir, sessions, projects):
+        """Scan ~/.factory/sessions/{project-dir}/ for UUID .jsonl files."""
+        if not base_dir.exists():
+            return
+        for proj_dir in base_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+
+            proj_name = proj_dir.name
+            # Clean project display name (same encoding as Claude projects)
+            display = proj_name
+            if display.startswith('-home-dev-'):
+                display = display[10:]
+            elif display.startswith('-home-dev'):
+                display = display[9:] or 'home'
+            display = 'droid/' + (display.replace('-', '/') if display else 'home')
+
+            for jsonl_file in proj_dir.glob('*.jsonl'):
+                sid_raw = jsonl_file.stem
+                if not re.match(
+                    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+                    sid_raw,
+                ):
+                    continue
+
+                try:
+                    st = jsonl_file.stat()
+                    mtime = st.st_mtime
+                    size = st.st_size
+                except OSError:
+                    continue
+                if size == 0:
+                    continue
+
+                meta = self._extract_droid_metadata(jsonl_file, size)
+                if meta is None:
+                    continue
+
+                sid = 'droid-' + sid_raw
+                projects.add(display)
+
+                age = time.time() - mtime
+                active = age < 120
+
+                first_ts = meta.get('first_ts')
+                duration = int(mtime - first_ts) if first_ts else 0
+
+                last_input = meta.get('last_input_tokens', 0)
+                model = meta.get('model', '')
+                ctx_size = self._get_context_size(model)
+                context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
+                sessions[sid] = {
+                    'sessionId': sid,
+                    'project': display,
+                    'source': 'droid',
+                    'slug': meta.get('slug', ''),
+                    'status': 'active' if active else 'completed',
+                    'model': model,
+                    'version': meta.get('version', ''),
+                    'mtime': mtime,
+                    'size': size,
+                    'eventCount': meta.get('event_count', 0),
+                    'cwd': meta.get('cwd', ''),
+                    'gitBranch': meta.get('gitBranch', ''),
+                    'subagentCount': 0,
+                    'duration': duration,
+                    'contextPct': context_pct,
+                    '_path': str(jsonl_file),
+                }
+
+    @staticmethod
+    def _extract_droid_metadata(path, size):
+        """Extract metadata from a Droid (.factory) session JSONL file."""
+        meta = {'event_count': max(1, size // 500)}
+
+        # Try reading model from companion .settings.json
+        settings_path = path.with_suffix('.settings.json')
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', errors='replace') as sf:
+                    settings = json.loads(sf.read())
+                    m = settings.get('model', '')
+                    if m:
+                        meta['model'] = m
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        try:
+            with open(path, 'r', errors='replace') as f:
+                for _ in range(15):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        t = obj.get('type', '')
+
+                        # Capture first timestamp
+                        if 'first_ts' not in meta:
+                            ts = obj.get('timestamp')
+                            if ts:
+                                if isinstance(ts, str):
+                                    try:
+                                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        meta['first_ts'] = dt.timestamp()
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif isinstance(ts, (int, float)):
+                                    meta['first_ts'] = ts / 1000 if ts > 1e12 else ts
+
+                        # session_start has title, sessionTitle, cwd
+                        if t == 'session_start':
+                            if not meta.get('slug'):
+                                # Prefer sessionTitle (cleaner) over title (full prompt)
+                                stitle = obj.get('sessionTitle', '')
+                                title = obj.get('title', '')
+                                chosen = stitle if stitle and stitle not in ('New Session', 'new session') else title
+                                if chosen and chosen not in ('New Session', 'new session'):
+                                    meta['slug'] = chosen[:80].replace('\n', ' ').strip()
+                            if not meta.get('cwd'):
+                                meta['cwd'] = obj.get('cwd', '')
+                            if not meta.get('version'):
+                                ver = obj.get('version', '')
+                                if ver:
+                                    meta['version'] = str(ver)
+
+                        # message type with assistant role may have model
+                        if t == 'message':
+                            msg = obj.get('message', {})
+                            role = msg.get('role', '')
+                            if role == 'assistant' and not meta.get('model'):
+                                m = msg.get('model', '')
+                                if m:
+                                    meta['model'] = m
+                            # User message as slug fallback
+                            if role == 'user' and not meta.get('slug'):
+                                content = msg.get('content', [])
+                                if isinstance(content, list):
+                                    for block in content:
+                                        if isinstance(block, dict) and block.get('type') == 'text':
+                                            text = block.get('text', '').strip()
+                                            if (text and len(text) <= 500
+                                                    and not text.startswith('<')
+                                                    and not text.startswith('#')):
+                                                meta['slug'] = text[:80].replace('\n', ' ').strip()
+                                                break
+
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                # Tail scan for last model (only if not already found in settings.json)
+                if not meta.get('model'):
+                    seek_back = min(size, 8192)
+                    f.seek(max(0, size - seek_back))
+                    if size > seek_back:
+                        f.readline()
+                    tail = f.read()
+
+                    for line in reversed(tail.strip().split('\n')):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            t = obj.get('type', '')
+
+                            if t == 'message':
+                                msg = obj.get('message', {})
+                                if msg.get('role') == 'assistant':
+                                    m = msg.get('model', '')
+                                    if m:
+                                        meta['model'] = m
+                                        break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+        except OSError:
+            return None
+
+        return meta
+
     # ── content search via ripgrep ────────────────────────────────────────
 
     _content_cache = {}  # class-level: {cache_key: {'ids': set, 'time': float}}
@@ -814,6 +1084,8 @@ class SessionIndex:
             dirs.append(str(CODEX_DIR))
         if source in (None, 'kimi') and KIMI_DIR.exists():
             dirs.append(str(KIMI_DIR))
+        if source in (None, 'droid') and DROID_DIR.exists():
+            dirs.append(str(DROID_DIR))
 
         if not dirs:
             return set()
@@ -863,7 +1135,7 @@ class SessionIndex:
         # Collect available sources
         sources = sorted(set(s.get('source', 'claude') for s in sessions))
 
-        if source and source in ('claude', 'openclaw', 'codex', 'kimi'):
+        if source and source in ('claude', 'openclaw', 'codex', 'kimi', 'droid'):
             sessions = [s for s in sessions if s.get('source') == source]
         if project:
             sessions = [s for s in sessions if s['project'] == project]
@@ -916,18 +1188,23 @@ class SessionIndex:
         # Validate format before filesystem fallback (prevent path traversal)
         if not re.match(r'^[a-zA-Z0-9_-]+$', session_id):
             return None
-        # Fallback filesystem scan
-        if PROJECTS_DIR.exists():
-            for d in PROJECTS_DIR.iterdir():
-                if not d.is_dir():
-                    continue
-                p = (d / f'{session_id}.jsonl').resolve()
-                try:
-                    p.relative_to(PROJECTS_DIR.resolve())
-                except ValueError:
-                    continue
-                if p.exists():
-                    return str(p)
+        # Fallback filesystem scan (Claude + Droid use {uuid}.jsonl naming)
+        raw_id = session_id
+        if session_id.startswith('droid-'):
+            raw_id = session_id[6:]
+
+        for base in (PROJECTS_DIR, DROID_DIR):
+            if base.exists():
+                for d in base.iterdir():
+                    if not d.is_dir():
+                        continue
+                    p = (d / f'{raw_id}.jsonl').resolve()
+                    try:
+                        p.relative_to(base.resolve())
+                    except ValueError:
+                        continue
+                    if p.exists():
+                        return str(p)
         return None
 
     def get_subagents(self, session_id):
@@ -2273,39 +2550,31 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not read system memory: {e}", file=sys.stderr)
 
-        recent_events = self.get_recent_events(limit=20)
-        anomaly_count = 0
-        log_date = None
+        log_date = datetime.now().strftime('%Y%m%d')
 
+        # Detect process changes and log events
+        _detect_and_log_events(processes, total_mem)
+
+        # Re-read recent events (now includes any just-logged ones)
+        recent_events = self.get_recent_events(limit=20)
+        # Re-count anomalies from updated file
+        anomaly_count = 0
         today_file = self._get_today_event_file()
         if today_file.exists():
-            log_date = datetime.now().strftime('%Y%m%d')
             try:
                 with open(today_file, 'r') as f:
                     for line in f:
                         if '"ANOMALY' in line:
                             anomaly_count += 1
-            except (OSError, IOError) as e:
-                print(f"Warning: Could not count anomalies: {e}", file=sys.stderr)
-        else:
-            event_files = self._get_event_files_by_date()
-            if event_files:
-                name = event_files[0].stem
-                if name.startswith('events_'):
-                    log_date = name.replace('events_', '')
-                else:
-                    log_date = name.replace('session_', '').replace('_events', '')
-                try:
-                    with open(event_files[0], 'r') as f:
-                        for line in f:
-                            if '"ANOMALY' in line:
-                                anomaly_count += 1
-                except (OSError, IOError) as e:
-                    print(f"Warning: Could not count anomalies: {e}", file=sys.stderr)
+            except (OSError, IOError):
+                pass
+
+        system_used_mb = max(0, system.get('total_mb', 0) - system.get('available_mb', 0))
 
         return {
             'processes': processes,
             'total_mem_mb': total_mem,
+            'system_used_mb': system_used_mb,
             'counts': f"claude:{counts['claude']},mcp:{counts['mcp']},worker:{counts['worker']},chroma:{counts['chroma']}",
             'system': system,
             'recent_events': recent_events,
@@ -2427,7 +2696,7 @@ def main():
   Press Ctrl+C to stop
 """)
 
-    with ReuseAddrTCPServer(("", PORT), TrackerAPIHandler) as httpd:
+    with ReuseAddrTCPServer(("127.0.0.1", PORT), TrackerAPIHandler) as httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
