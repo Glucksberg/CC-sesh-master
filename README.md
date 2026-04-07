@@ -90,6 +90,41 @@ Use `after=<uuid>` for cursor-based incremental updates. The server reads from t
 - **OpenClaw sessions:** `~/.openclaw/agents/<agent>/sessions/<sessionId>.jsonl`
 - **Process events:** `logs/events_YYYYMMDD.jsonl` (written by claude-tracker.sh)
 
+## Session Migration Notes
+
+Session "migration" is not implemented in the dashboard today. If added later, it should be treated as two different classes of operation:
+
+- **Native resume/fork:** only available when the destination CLI can reopen its own session format.
+- **Context clone:** create a new session in another CLI using a generated transcript/bundle from the source session.
+
+### What is feasible today
+
+- **Claude -> Claude (fork or move to another workspace):** best-supported case. This only makes sense when the goal is to fork the conversation or continue it in another directory/workspace. Claude Code exposes native resume/fork flows (`--resume`, `--continue`, `--fork-session`), so a future "Migrate" button could offer a true clone/fork behavior here. If the user only wants to keep working in the same Claude session and same workspace, that is just resume, not migration.
+- **Claude -> Codex**
+- **Claude -> Kimi**
+- **Codex -> Claude**
+- **Codex -> Kimi**
+- **Kimi -> Claude**
+- **Kimi -> Codex**
+
+The six cross-tool cases above should be treated as **context cloning**, not true native migration. The dashboard can already read and normalize these sessions for display, but each CLI persists different on-disk formats and session metadata, so directly copying session files between tools would be fragile.
+
+### Recommended future design
+
+For cross-tool migration, generate a migration bundle containing:
+
+- source session metadata (`source`, `cwd`, model, timestamps)
+- full conversation transcript
+- cleaned tool calls and tool results
+- optional compact summary for long sessions
+
+Then launch a **new** destination session in the same workspace and seed it with that bundle as initial context.
+
+### Out of scope for now
+
+- **OpenClaw-specific migration:** intentionally deferred. At the moment we do not treat OpenClaw as having a stable, first-class "resume this exact session in another tool" flow.
+- **Direct raw file transplantation** between Claude/Codex/Kimi session stores: not recommended.
+
 ## Requirements
 
 - Python 3.8+

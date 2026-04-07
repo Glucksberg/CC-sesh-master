@@ -1819,7 +1819,9 @@
                             <div style="display:flex;align-items:center;gap:8px">
                                 <button class="back-to-parent-btn" id="backToParentBtn" onclick="backToParentSession()" style="display:none">&#x25C0; Parent</button>
                                 <button class="export-btn" id="exportSessionBtn" onclick="exportSession()" style="display:none">&#x2B07; Export</button>
-                                <button class="export-btn" id="copySessionBtn" onclick="copySession()" style="display:none">&#x2398; Copy</button>
+                                <button class="export-btn" id="copySessionBtn" onclick="copySession('full', 'copySessionBtn')" data-label="&#x2398; Copy" title="Copy full session with messages, tools, results, and system events" style="display:none">&#x2398; Copy</button>
+                                <button class="export-btn" id="copyConversationBtn" onclick="copySession('conversation', 'copyConversationBtn')" data-label="&#x1F4AC; Chat" title="Copy only user and assistant messages" style="display:none">&#x1F4AC; Chat</button>
+                                <button class="export-btn" id="copyCompactBtn" onclick="copySession('compact', 'copyCompactBtn')" data-label="&#x2726; Clean" title="Copy full conversation plus cleaned tool calls and results" style="display:none">&#x2726; Clean</button>
                                 <span class="panel-badge" id="conversationBadge">Select a session</span>
                             </div>
                         </div>
@@ -2560,6 +2562,7 @@
                 if (!res.ok) throw new Error('Failed');
                 const data = await res.json();
                 const allEvents = data.events || [];
+                const compactionSummaries = await fetchCompactionSummaries();
 
                 const session = svSessions.find(s => s.sessionId === svSelectedId);
                 let slug, exportId;
@@ -2614,6 +2617,16 @@
                     }
                 }
 
+                if (!svViewingSubagent && compactionSummaries.length > 0) {
+                    md += '## Compaction Summaries\n\n';
+                    for (const item of compactionSummaries) {
+                        const time = formatEventTime(item.timestamp);
+                        const ts = time ? ' [' + time + ']' : '';
+                        md += '### Summary #' + item.index + ts + '\n\n';
+                        md += (item.summary || '') + '\n\n';
+                    }
+                }
+
                 // Download
                 const blob = new Blob([md], { type: 'text/markdown' });
                 const url = URL.createObjectURL(blob);
@@ -2631,9 +2644,133 @@
             btn.innerHTML = '&#x2B07; Export';
         }
 
-        async function copySession() {
+        function normalizeClipboardText(text) {
+            return String(text || '')
+                .replace(/\r\n?/g, '\n')
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+        }
+
+        function stringifyClipboardValue(value, pretty = false) {
+            if (value == null) return '';
+            if (typeof value === 'string') return value;
+            try {
+                return JSON.stringify(value, null, pretty ? 2 : 0);
+            } catch (_) {
+                return String(value);
+            }
+        }
+
+        function cleanClipboardText(text) {
+            const raw = stringifyClipboardValue(text, true);
+            let out = raw
+                .replace(/\u001b\[[0-9;]*m/g, '')
+                .replace(/\r\n?/g, '\n')
+                .trim();
+
+            if (!out) return '';
+
+            if (/^[\[{]/.test(out)) {
+                try {
+                    out = JSON.stringify(JSON.parse(out), null, 2);
+                } catch (_) {}
+            }
+
+            out = out
+                .replace(/data:[^;\s]+;base64,[A-Za-z0-9+/=]+/g, '[data-url omitted]')
+                .replace(/\b[A-Za-z0-9+/]{160,}={0,2}\b/g, m => '[blob omitted ' + m.length + ' chars]')
+                .replace(/[ \t]+$/gm, '')
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+
+            return out;
+        }
+
+        async function fetchCompactionSummaries() {
+            if (!svSelectedId || svViewingSubagent) return [];
+
+            try {
+                const res = await fetch(SESSION_API + '/' + svSelectedId + '/compaction-summaries');
+                if (!res.ok) return [];
+                const data = await res.json();
+                return data.summaries || [];
+            } catch (err) {
+                console.error('Compaction summary fetch error:', err);
+                return [];
+            }
+        }
+
+        function buildSessionCopyText(allEvents, mode, compactionSummaries = []) {
+            const blocks = [];
+
+            for (const ev of allEvents) {
+                if (ev.type === 'user') {
+                    if (ev.text && ev.userType === 'external') {
+                        const body = normalizeClipboardText(ev.text);
+                        if (body) blocks.push('USER: ' + body);
+                    } else if (mode === 'full' && ev.text) {
+                        const kind = (ev.userType || 'SYSTEM').toUpperCase();
+                        const body = normalizeClipboardText(ev.text);
+                        if (body) blocks.push('[' + kind + ']\n' + body);
+                    }
+
+                    if (mode !== 'conversation' && ev.tool_results && ev.tool_results.length > 0) {
+                        for (const tr of ev.tool_results) {
+                            const status = tr.is_error ? 'ERROR' : 'OK';
+                            const content = mode === 'compact'
+                                ? cleanClipboardText(tr.content)
+                                : stringifyClipboardValue(tr.content, true).trim();
+                            blocks.push('[TOOL RESULT ' + status + ']\n' + content);
+                        }
+                    }
+                } else if (ev.type === 'assistant') {
+                    if (ev.text) {
+                        const body = normalizeClipboardText(ev.text);
+                        if (body) blocks.push('ASSISTANT: ' + body);
+                    }
+
+                    if (mode !== 'conversation' && ev.tool_uses && ev.tool_uses.length > 0) {
+                        for (const tu of ev.tool_uses) {
+                            const input = mode === 'compact'
+                                ? cleanClipboardText(tu.input)
+                                : stringifyClipboardValue(tu.input, true).trim();
+                            blocks.push(input
+                                ? '[TOOL CALL ' + tu.name + ']\n' + input
+                                : '[TOOL CALL ' + tu.name + ']');
+                        }
+                    }
+                } else if (ev.type === 'system' && mode === 'full') {
+                    const sub = ev.subtype || 'system';
+                    blocks.push('--- ' + sub + ' ---');
+                }
+            }
+
+            if (mode !== 'conversation' && compactionSummaries.length > 0) {
+                blocks.push('=== COMPACTION SUMMARIES ===');
+                for (const item of compactionSummaries) {
+                    const time = formatEventTime(item.timestamp);
+                    const heading = 'Summary #' + item.index + (time ? ' [' + time + ']' : '');
+                    const body = mode === 'compact'
+                        ? cleanClipboardText(item.summary)
+                        : normalizeClipboardText(item.summary);
+                    blocks.push(body ? heading + '\n' + body : heading);
+                }
+            }
+
+            return blocks.join('\n\n').trim();
+        }
+
+        function restoreActionButton(btn) {
+            btn.disabled = false;
+            btn.innerHTML = btn.dataset.label || btn.innerHTML;
+        }
+
+        async function copySession(mode = 'full', buttonId = 'copySessionBtn') {
             if (!svSelectedId) return;
-            const btn = document.getElementById('copySessionBtn');
+            const btn = document.getElementById(buttonId);
+            if (!btn) return;
             btn.disabled = true;
             btn.textContent = 'Copying...';
             const targetId = svViewingSubagent || svSelectedId;
@@ -2643,43 +2780,18 @@
                 if (!res.ok) throw new Error('Failed');
                 const data = await res.json();
                 const allEvents = data.events || [];
-
-                let text = '';
-                for (const ev of allEvents) {
-                    if (ev.type === 'user') {
-                        if (ev.tool_results && ev.tool_results.length > 0) {
-                            for (const tr of ev.tool_results) {
-                                const status = tr.is_error ? 'ERROR' : 'OK';
-                                const content = (tr.content || '').trim();
-                                const summary = content.length > 200
-                                    ? content.slice(0, 200) + '...'
-                                    : content;
-                                text += '[RESULT ' + status + '] ' + summary + '\n\n';
-                            }
-                        } else if (ev.text && ev.userType === 'external') {
-                            text += 'USER: ' + ev.text.trim() + '\n\n';
-                        }
-                    } else if (ev.type === 'assistant') {
-                        if (ev.text) {
-                            text += 'ASSISTANT: ' + ev.text.trim() + '\n\n';
-                        }
-                        if (ev.tool_uses && ev.tool_uses.length > 0) {
-                            const names = ev.tool_uses.map(t => t.name).join(', ');
-                            text += '> tool: ' + names + '\n\n';
-                        }
-                    } else if (ev.type === 'system') {
-                        const sub = ev.subtype || 'system';
-                        text += '--- ' + sub + ' ---\n\n';
-                    }
-                }
+                const compactionSummaries = mode === 'conversation'
+                    ? []
+                    : await fetchCompactionSummaries();
+                const text = buildSessionCopyText(allEvents, mode, compactionSummaries);
 
                 await navigator.clipboard.writeText(text.trim());
                 btn.textContent = 'Copied!';
-                setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; }, 1500);
+                setTimeout(() => { restoreActionButton(btn); }, 1500);
             } catch (err) {
                 console.error('Copy error:', err);
                 btn.textContent = 'Failed';
-                setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; }, 1500);
+                setTimeout(() => { restoreActionButton(btn); }, 1500);
             }
 
             btn.disabled = false;
@@ -2696,6 +2808,8 @@
             }
             document.getElementById('exportSessionBtn').style.display = svSelectedId ? '' : 'none';
             document.getElementById('copySessionBtn').style.display = svSelectedId ? '' : 'none';
+            document.getElementById('copyConversationBtn').style.display = svSelectedId ? '' : 'none';
+            document.getElementById('copyCompactBtn').style.display = svSelectedId ? '' : 'none';
         }
 
         // ═══════════════════════════════════════════════════════════════

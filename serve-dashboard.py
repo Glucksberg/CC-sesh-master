@@ -1238,6 +1238,33 @@ class SessionEventReader:
         """Check if path is under the Kimi sessions directory."""
         return str(path).startswith(str(KIMI_DIR))
 
+    @staticmethod
+    def extract_compaction_summary(events):
+        """Extract the final compact-summary text from a subagent event stream."""
+        if not events:
+            return {'timestamp': '', 'summary': ''}
+
+        last_ts = ''
+        last_text = ''
+        for ev in events:
+            if ev.get('type') == 'assistant' and ev.get('text'):
+                last_ts = ev.get('timestamp', '')
+                last_text = ev.get('text', '').strip()
+
+        if not last_text:
+            return {'timestamp': '', 'summary': ''}
+
+        match = re.search(r'<summary>\s*(.*?)\s*</summary>', last_text, re.S | re.I)
+        if match:
+            summary = match.group(1).strip()
+            if summary:
+                last_text = summary
+
+        return {
+            'timestamp': last_ts,
+            'summary': last_text,
+        }
+
     @classmethod
     def read_events(cls, path, after=None, limit=100, types=None, full=False):
         events = []
@@ -2341,6 +2368,9 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         elif re.match(r'^/api/sessions/[^/]+/subagents$', path):
             sid = path.split('/')[3]
             self.handle_session_subagents(sid)
+        elif re.match(r'^/api/sessions/[^/]+/compaction-summaries$', path):
+            sid = path.split('/')[3]
+            self.handle_session_compaction_summaries(sid)
         elif re.match(r'^/api/sessions/[^/]+/raw-event/[^/]+$', path):
             parts = path.split('/')
             self.handle_raw_event(parts[3], parts[5])
@@ -2442,6 +2472,49 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 'sessionId': session_id,
                 'subagents': subagents,
                 'total': len(subagents),
+            })
+        except Exception as e:
+            self.send_json({'error': str(e)}, status=500)
+
+    def handle_session_compaction_summaries(self, session_id):
+        try:
+            subagents = session_index.get_subagents(session_id)
+            compact_agents = [
+                sa for sa in subagents
+                if sa.get('agentType') == 'compact' and not sa.get('ephemeral')
+            ]
+            compact_agents.sort(key=lambda sa: (
+                sa.get('mtime', 0),
+                sa.get('filename', ''),
+                sa.get('id', ''),
+            ))
+
+            summaries = []
+            for idx, sa in enumerate(compact_agents, start=1):
+                path = session_index.get_session_path(sa.get('id', ''))
+                if not path:
+                    continue
+
+                events = SessionEventReader.read_events(
+                    path, after=None, limit=10000, types=None, full=True,
+                )
+                extracted = SessionEventReader.extract_compaction_summary(events)
+                if not extracted.get('summary'):
+                    continue
+
+                summaries.append({
+                    'index': idx,
+                    'subagentId': sa.get('id', ''),
+                    'timestamp': extracted.get('timestamp', '') or '',
+                    'summary': extracted.get('summary', ''),
+                    'slug': sa.get('slug', ''),
+                    'model': sa.get('model', ''),
+                })
+
+            self.send_json({
+                'sessionId': session_id,
+                'summaries': summaries,
+                'total': len(summaries),
             })
         except Exception as e:
             self.send_json({'error': str(e)}, status=500)
