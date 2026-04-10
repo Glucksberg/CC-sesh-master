@@ -2767,6 +2767,59 @@
             btn.innerHTML = btn.dataset.label || btn.innerHTML;
         }
 
+        async function writeTextToClipboard(text) {
+            const value = String(text || '');
+
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await navigator.clipboard.writeText(value);
+                    return;
+                } catch (err) {
+                    console.warn('navigator.clipboard failed, trying fallback copy', err);
+                }
+            }
+
+            const textarea = document.createElement('textarea');
+            textarea.value = value;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.top = '-1000px';
+            textarea.style.left = '-1000px';
+            textarea.style.opacity = '0';
+
+            document.body.appendChild(textarea);
+
+            const selection = document.getSelection();
+            const previousRange = selection && selection.rangeCount > 0
+                ? selection.getRangeAt(0)
+                : null;
+            const previousActive = document.activeElement;
+
+            textarea.focus();
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length);
+
+            let copied = false;
+            try {
+                copied = document.execCommand('copy');
+            } finally {
+                document.body.removeChild(textarea);
+
+                if (previousActive && typeof previousActive.focus === 'function') {
+                    previousActive.focus();
+                }
+
+                if (selection) {
+                    selection.removeAllRanges();
+                    if (previousRange) selection.addRange(previousRange);
+                }
+            }
+
+            if (!copied) {
+                throw new Error('Clipboard write failed');
+            }
+        }
+
         async function copySession(mode = 'full', buttonId = 'copySessionBtn') {
             if (!svSelectedId) return;
             const btn = document.getElementById(buttonId);
@@ -2785,7 +2838,7 @@
                     : await fetchCompactionSummaries();
                 const text = buildSessionCopyText(allEvents, mode, compactionSummaries);
 
-                await navigator.clipboard.writeText(text.trim());
+                await writeTextToClipboard(text.trim());
                 btn.textContent = 'Copied!';
                 setTimeout(() => { restoreActionButton(btn); }, 1500);
             } catch (err) {
