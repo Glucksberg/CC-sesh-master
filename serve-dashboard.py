@@ -108,6 +108,79 @@ _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 DROID_DIR = Path.home() / '.factory' / 'sessions'
 
+# ─── WSL directory discovery ───────────────────────────────────────────────────
+WSL_PROJECTS_DIRS = []   # additional ~/.claude/projects from WSL distros
+WSL_CODEX_DIRS = []      # additional ~/.codex/sessions from WSL distros
+WSL_OPENCLAW_DIRS = []   # additional ~/.openclaw/agents from WSL distros
+WSL_KIMI_DIRS = []       # additional ~/.kimi/sessions from WSL distros
+WSL_DROID_DIRS = []      # additional ~/.factory/sessions from WSL distros
+
+def _discover_wsl_homes():
+    """Discover home directories from installed WSL distros."""
+    if sys.platform != 'win32':
+        return []
+    try:
+        result = subprocess.run(
+            ['wsl', '-l', '-q'], capture_output=True, timeout=5,
+        )
+        raw = result.stdout
+        # wsl -l outputs UTF-16LE on Windows
+        try:
+            text = raw.decode('utf-16-le')
+        except (UnicodeDecodeError, ValueError):
+            text = raw.decode('utf-8', errors='replace')
+        distros = [d.strip().strip('\x00') for d in text.splitlines() if d.strip().strip('\x00')]
+        # Filter out docker-desktop distros
+        distros = [d for d in distros if 'docker' not in d.lower()]
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return []
+
+    homes = []
+    for distro in distros:
+        try:
+            result = subprocess.run(
+                ['wsl', '-d', distro, '-e', 'bash', '-c', 'echo $HOME'],
+                capture_output=True, text=True, timeout=5,
+            )
+            home = result.stdout.strip()
+            if home:
+                wsl_path = Path(f'//wsl.localhost/{distro}{home}')
+                if wsl_path.exists():
+                    homes.append(wsl_path)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return homes
+
+def _init_wsl_dirs():
+    """Populate WSL_*_DIRS lists from discovered WSL home directories."""
+    global WSL_PROJECTS_DIRS, WSL_CODEX_DIRS, WSL_OPENCLAW_DIRS, WSL_KIMI_DIRS, WSL_DROID_DIRS
+    for wsl_home in _discover_wsl_homes():
+        proj = wsl_home / '.claude' / 'projects'
+        if proj.exists():
+            WSL_PROJECTS_DIRS.append(proj)
+        codex = wsl_home / '.codex' / 'sessions'
+        if codex.exists():
+            WSL_CODEX_DIRS.append(codex)
+        openclaw = wsl_home / '.openclaw' / 'agents'
+        if openclaw.exists():
+            WSL_OPENCLAW_DIRS.append(openclaw)
+        kimi = wsl_home / '.kimi' / 'sessions'
+        if kimi.exists():
+            WSL_KIMI_DIRS.append(kimi)
+        droid = wsl_home / '.factory' / 'sessions'
+        if droid.exists():
+            WSL_DROID_DIRS.append(droid)
+    total = len(WSL_PROJECTS_DIRS) + len(WSL_CODEX_DIRS) + len(WSL_OPENCLAW_DIRS) + len(WSL_KIMI_DIRS) + len(WSL_DROID_DIRS)
+    if total:
+        print(f"WSL: found {total} additional session directories")
+
+try:
+    _init_wsl_dirs()
+except Exception as e:
+    print(f"WSL discovery failed (non-fatal): {e}", file=sys.stderr)
+
+ALL_CODEX_DIRS = [CODEX_DIR] + WSL_CODEX_DIRS
+
 MODEL_CONTEXT_WINDOWS = {
     'opus-4': 200_000,
     'sonnet-4': 200_000,
@@ -191,31 +264,60 @@ class SessionIndex:
                     subagent_paths, projects, source='claude',
                 )
 
+        # ── Scan WSL ~/.claude/projects/ ────────────────────────────
+        for wsl_proj_dir in WSL_PROJECTS_DIRS:
+            if wsl_proj_dir.exists():
+                for proj_dir in wsl_proj_dir.iterdir():
+                    if not proj_dir.is_dir():
+                        continue
+                    proj_name = proj_dir.name
+                    if 'observer' in proj_name.lower():
+                        continue
+                    if 'openclaw-workspace' in proj_name:
+                        continue
+                    display = proj_name
+                    if display.startswith('-home-k1-'):
+                        display = display[9:]
+                    elif display.startswith('-home-k1'):
+                        display = display[8:] or 'home'
+                    elif display.startswith('-mnt-c-'):
+                        display = display[7:]
+                    display = display.replace('-', '/') if display else 'home'
+                    display = 'wsl/' + display
+                    self._scan_session_dir(
+                        proj_dir, display, sessions, subagents,
+                        subagent_paths, projects, source='claude',
+                    )
+
         # ── Scan ~/.openclaw/agents/*/sessions/ ──────────────────────
-        if OPENCLAW_DIR.exists():
-            for agent_dir in OPENCLAW_DIR.iterdir():
-                if not agent_dir.is_dir():
-                    continue
-                sess_dir = agent_dir / 'sessions'
-                if not sess_dir.is_dir():
-                    continue
-                display = 'openclaw/' + agent_dir.name
-                self._scan_session_dir(
-                    sess_dir, display, sessions, subagents,
-                    subagent_paths, projects, source='openclaw',
-                )
+        for openclaw_dir in [OPENCLAW_DIR] + WSL_OPENCLAW_DIRS:
+            if openclaw_dir.exists():
+                for agent_dir in openclaw_dir.iterdir():
+                    if not agent_dir.is_dir():
+                        continue
+                    sess_dir = agent_dir / 'sessions'
+                    if not sess_dir.is_dir():
+                        continue
+                    display = 'openclaw/' + agent_dir.name
+                    self._scan_session_dir(
+                        sess_dir, display, sessions, subagents,
+                        subagent_paths, projects, source='openclaw',
+                    )
 
-        # ── Scan ~/.codex/sessions/ ──────────────────────────────────
-        if CODEX_DIR.exists():
-            self._scan_codex_sessions(CODEX_DIR, sessions, projects)
+        # ── Scan ~/.codex/sessions/ (Windows + WSL) ────────────────────
+        for codex_dir in [CODEX_DIR] + WSL_CODEX_DIRS:
+            if codex_dir.exists():
+                self._scan_codex_sessions(codex_dir, sessions, projects)
 
-        # ── Scan ~/.kimi/sessions/ ───────────────────────────────────
-        if KIMI_DIR.exists():
-            self._scan_kimi_sessions(KIMI_DIR, sessions, projects)
+        # ── Scan ~/.kimi/sessions/ (Windows + WSL) ───────────────────
+        for kimi_dir in [KIMI_DIR] + WSL_KIMI_DIRS:
+            if kimi_dir.exists():
+                self._scan_kimi_sessions(kimi_dir, sessions, projects)
 
-        # ── Scan ~/.factory/sessions/ (Droid) ─────────────────────────
-        if DROID_DIR.exists():
-            self._scan_droid_sessions(DROID_DIR, sessions, projects)
+        # ── Scan ~/.factory/sessions/ (Droid) (Windows + WSL) ────────
+        for droid_dir in [DROID_DIR] + WSL_DROID_DIRS:
+            if droid_dir.exists():
+                self._scan_droid_sessions(droid_dir, sessions, projects)
 
         with self._lock:
             self._sessions = sessions
@@ -1076,16 +1178,36 @@ class SessionIndex:
 
         # Build search directories based on source filter
         dirs = []
-        if source in (None, 'claude') and PROJECTS_DIR.exists():
-            dirs.append(str(PROJECTS_DIR))
-        if source in (None, 'openclaw') and OPENCLAW_DIR.exists():
-            dirs.append(str(OPENCLAW_DIR))
-        if source in (None, 'codex') and CODEX_DIR.exists():
-            dirs.append(str(CODEX_DIR))
-        if source in (None, 'kimi') and KIMI_DIR.exists():
-            dirs.append(str(KIMI_DIR))
-        if source in (None, 'droid') and DROID_DIR.exists():
-            dirs.append(str(DROID_DIR))
+        if source in (None, 'claude'):
+            if PROJECTS_DIR.exists():
+                dirs.append(str(PROJECTS_DIR))
+            for d in WSL_PROJECTS_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
+        if source in (None, 'openclaw'):
+            if OPENCLAW_DIR.exists():
+                dirs.append(str(OPENCLAW_DIR))
+            for d in WSL_OPENCLAW_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
+        if source in (None, 'codex'):
+            if CODEX_DIR.exists():
+                dirs.append(str(CODEX_DIR))
+            for d in WSL_CODEX_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
+        if source in (None, 'kimi'):
+            if KIMI_DIR.exists():
+                dirs.append(str(KIMI_DIR))
+            for d in WSL_KIMI_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
+        if source in (None, 'droid'):
+            if DROID_DIR.exists():
+                dirs.append(str(DROID_DIR))
+            for d in WSL_DROID_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
 
         if not dirs:
             return set()
@@ -1193,7 +1315,7 @@ class SessionIndex:
         if session_id.startswith('droid-'):
             raw_id = session_id[6:]
 
-        for base in (PROJECTS_DIR, DROID_DIR):
+        for base in [PROJECTS_DIR, DROID_DIR] + WSL_PROJECTS_DIRS + WSL_DROID_DIRS:
             if base.exists():
                 for d in base.iterdir():
                     if not d.is_dir():
@@ -1230,13 +1352,15 @@ class SessionEventReader:
 
     @staticmethod
     def _is_codex_path(path):
-        """Check if path is under the Codex sessions directory."""
-        return str(path).startswith(str(CODEX_DIR))
+        """Check if path is under any Codex sessions directory (Windows or WSL)."""
+        s = str(path)
+        return any(s.startswith(str(d)) for d in ALL_CODEX_DIRS)
 
     @staticmethod
     def _is_kimi_path(path):
-        """Check if path is under the Kimi sessions directory."""
-        return str(path).startswith(str(KIMI_DIR))
+        """Check if path is under any Kimi sessions directory (Windows or WSL)."""
+        s = str(path)
+        return any(s.startswith(str(d)) for d in [KIMI_DIR] + WSL_KIMI_DIRS)
 
     @staticmethod
     def extract_compaction_summary(events):
