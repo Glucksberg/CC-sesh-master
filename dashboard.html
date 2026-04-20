@@ -2827,24 +2827,61 @@
             btn.disabled = true;
             btn.textContent = 'Copying...';
             const targetId = svViewingSubagent || svSelectedId;
+            let stage = 'init';
 
-            try {
+            // Pipeline that produces the final text as a Blob.
+            // Wrapped in a promise so ClipboardItem can consume it directly
+            // (Safari requires clipboard.write() to be called synchronously
+            // from the user gesture — passing a Promise<Blob> lets us do the
+            // async fetch/build work without losing the gesture).
+            const buildTextBlob = (async () => {
+                stage = 'fetch-events';
                 const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=10000&full=1');
-                if (!res.ok) throw new Error('Failed');
+                if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
+                stage = 'parse-json';
                 const data = await res.json();
                 const allEvents = data.events || [];
+                stage = 'fetch-compaction';
                 const compactionSummaries = mode === 'conversation'
                     ? []
                     : await fetchCompactionSummaries();
-                const text = buildSessionCopyText(allEvents, mode, compactionSummaries);
+                stage = 'build-text';
+                const text = buildSessionCopyText(allEvents, mode, compactionSummaries).trim();
+                return new Blob([text], { type: 'text/plain' });
+            })();
 
-                await writeTextToClipboard(text.trim());
+            try {
+                // Preferred path: ClipboardItem with Promise<Blob>.
+                // Works in Safari because clipboard.write() is invoked
+                // synchronously in the click handler, preserving the gesture.
+                if (navigator.clipboard && window.isSecureContext && typeof ClipboardItem !== 'undefined') {
+                    stage = 'write-clipboard-item';
+                    const item = new ClipboardItem({ 'text/plain': buildTextBlob });
+                    await navigator.clipboard.write([item]);
+                } else {
+                    const blob = await buildTextBlob;
+                    const text = await blob.text();
+                    stage = 'write-clipboard (' + text.length + ' chars)';
+                    await writeTextToClipboard(text);
+                }
                 btn.textContent = 'Copied!';
                 setTimeout(() => { restoreActionButton(btn); }, 1500);
             } catch (err) {
-                console.error('Copy error:', err);
-                btn.textContent = 'Failed';
-                setTimeout(() => { restoreActionButton(btn); }, 1500);
+                // Last-resort fallback: try writeText / execCommand path.
+                try {
+                    const blob = await buildTextBlob;
+                    const text = await blob.text();
+                    stage = 'write-clipboard-fallback (' + text.length + ' chars)';
+                    await writeTextToClipboard(text);
+                    btn.textContent = 'Copied!';
+                    setTimeout(() => { restoreActionButton(btn); }, 1500);
+                } catch (err2) {
+                    console.error('Copy error at stage', stage, err, err2);
+                    const msg = (err2 && err2.message) ? err2.message : String(err2);
+                    btn.textContent = 'Failed';
+                    alert('Copy failed at stage: ' + stage + '\n\nError: ' + msg);
+                    setTimeout(() => { restoreActionButton(btn); }, 1500);
+                }
             }
 
             btn.disabled = false;
