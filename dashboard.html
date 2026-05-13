@@ -2753,6 +2753,12 @@
                 (omittedLines ? ', ' + omittedLines + ' lines' : '') + ']';
         }
 
+        function summarizeCleanText(text, isError = false) {
+            const maxChars = isError ? 2200 : 900;
+            const maxLines = isError ? 60 : 20;
+            return summarizeCleanestText(text, maxChars, maxLines);
+        }
+
         async function fetchCompactionSummaries() {
             if (!svSelectedId || svViewingSubagent) return [];
 
@@ -2803,7 +2809,7 @@
                             if (cleanestMode) {
                                 content = summarizeCleanestText(tr.content, tr.is_error ? 1400 : 420, tr.is_error ? 40 : 10);
                             } else if (cleanMode) {
-                                content = cleanClipboardText(tr.content, false);
+                                content = summarizeCleanText(tr.content, tr.is_error);
                             } else {
                                 content = stringifyClipboardValue(tr.content, true).trim();
                             }
