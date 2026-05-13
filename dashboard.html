@@ -2991,7 +2991,7 @@
             btn.textContent = 'Copied';
 
             try {
-                await navigator.clipboard.writeText(sessionId);
+                await writeTextToClipboard(sessionId);
                 setTimeout(() => { restoreActionButton(btn); }, 1500);
             } catch (err) {
                 console.error('Copy session ID error:', err);
