@@ -1121,6 +1121,47 @@
             box-shadow: none;
         }
 
+        .copy-menu-wrap {
+            position: relative;
+            display: inline-block;
+        }
+
+        .copy-menu {
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            z-index: 50;
+            display: none;
+            min-width: 190px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--phosphor-dim);
+            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+            padding: 4px;
+        }
+
+        .copy-menu.open {
+            display: block;
+        }
+
+        .copy-menu button {
+            width: 100%;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.68rem;
+            background: transparent;
+            border: 0;
+            color: var(--text-primary);
+            padding: 8px 10px;
+            text-align: left;
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+        }
+
+        .copy-menu button:hover {
+            background: rgba(0, 255, 136, 0.12);
+            color: var(--phosphor-green);
+        }
+
         /* Subagent badge on session items */
         .session-badge.subagents {
             background: rgba(255, 165, 2, 0.15);
@@ -1819,9 +1860,16 @@
                             <div style="display:flex;align-items:center;gap:8px">
                                 <button class="back-to-parent-btn" id="backToParentBtn" onclick="backToParentSession()" style="display:none">&#x25C0; Parent</button>
                                 <button class="export-btn" id="exportSessionBtn" onclick="exportSession()" style="display:none">&#x2B07; Export</button>
-                                <button class="export-btn" id="copySessionBtn" onclick="copySession('full', 'copySessionBtn')" data-label="&#x2398; Copy" title="Copy full session with messages, tools, results, and system events" style="display:none">&#x2398; Copy</button>
-                                <button class="export-btn" id="copyConversationBtn" onclick="copySession('conversation', 'copyConversationBtn')" data-label="&#x1F4AC; Chat" title="Copy only user and assistant messages" style="display:none">&#x1F4AC; Chat</button>
-                                <button class="export-btn" id="copyCompactBtn" onclick="copySession('compact', 'copyCompactBtn')" data-label="&#x2726; Clean" title="Copy full conversation plus cleaned tool calls and results" style="display:none">&#x2726; Clean</button>
+                                <button class="export-btn" id="copySessionIdBtn" onclick="copyCurrentSessionId()" data-label="ID" title="Copy current session ID" style="display:none">ID</button>
+                                <div class="copy-menu-wrap" id="copyMenuWrap" style="display:none">
+                                    <button class="export-btn" id="copySessionBtn" onclick="toggleCopyMenu(event)" data-label="&#x2398; Copy &#x25BE;" title="Choose copy format">&#x2398; Copy &#x25BE;</button>
+                                    <div class="copy-menu" id="copyMenu">
+                                        <button type="button" onclick="copySession('full')">Full</button>
+                                        <button type="button" onclick="copySession('conversation')">Chat</button>
+                                        <button type="button" onclick="copySession('clean')">Full clean</button>
+                                        <button type="button" onclick="copySession('cleanest')">Full cleanest</button>
+                                    </div>
+                                </div>
                                 <span class="panel-badge" id="conversationBadge">Select a session</span>
                             </div>
                         </div>
@@ -1855,7 +1903,7 @@
                 </div>
                 <div class="footer-item">
                     <span class="footer-label">Endpoint:</span>
-                    <span class="footer-value">localhost:37778</span>
+                    <span class="footer-value" id="endpointLabel">--</span>
                 </div>
             </div>
         </footer>
@@ -1865,13 +1913,15 @@
         // ═══════════════════════════════════════════════════════════════
         // Configuration
         // ═══════════════════════════════════════════════════════════════
-        const API_URL = 'http://localhost:37778/api/tracker';
-        const SESSION_API = 'http://localhost:37778/api/sessions';
+        const API_ORIGIN = window.location.origin === 'null' ? 'http://localhost:37778' : window.location.origin;
+        const API_URL = API_ORIGIN + '/api/tracker';
+        const SESSION_API = API_ORIGIN + '/api/sessions';
         const POLL_INTERVAL = 2000;
         const SESSION_LIST_POLL = 1000;
         const SESSION_EVENTS_POLL = 1000;
         const MAX_EVENTS = 100;
         const MAX_CHART_POINTS = 60;
+        document.getElementById('endpointLabel').textContent = API_ORIGIN.replace(/^https?:\/\//, '');
 
         const VALID_EVENT_TYPES = new Set(['spawn', 'exit', 'anomaly', 'state-change', 'mem-change', 'progress', 'unknown']);
         const VALID_PROCESS_TYPES = new Set(['claude-code', 'mcp-server', 'worker', 'chroma', 'other']);
@@ -2662,8 +2712,8 @@
             }
         }
 
-        function cleanClipboardText(text) {
-            const raw = stringifyClipboardValue(text, true);
+        function cleanClipboardText(text, prettyJson = false) {
+            const raw = stringifyClipboardValue(text, prettyJson);
             let out = raw
                 .replace(/\u001b\[[0-9;]*m/g, '')
                 .replace(/\r\n?/g, '\n')
@@ -2673,7 +2723,7 @@
 
             if (/^[\[{]/.test(out)) {
                 try {
-                    out = JSON.stringify(JSON.parse(out), null, 2);
+                    out = JSON.stringify(JSON.parse(out), null, prettyJson ? 2 : 0);
                 } catch (_) {}
             }
 
@@ -2686,6 +2736,21 @@
                 .trim();
 
             return out;
+        }
+
+        function summarizeCleanestText(text, maxChars = 600, maxLines = 12) {
+            const out = cleanClipboardText(text, false);
+            if (!out) return '';
+
+            const lines = out.split('\n');
+            if (out.length <= maxChars && lines.length <= maxLines) return out;
+
+            const head = lines.slice(0, maxLines).join('\n');
+            const clipped = (head.length > maxChars ? head.slice(0, maxChars) : head).trim();
+            const omittedChars = Math.max(0, out.length - clipped.length);
+            const omittedLines = Math.max(0, lines.length - maxLines);
+            return clipped + '\n[omitted ' + omittedChars + ' chars' +
+                (omittedLines ? ', ' + omittedLines + ' lines' : '') + ']';
         }
 
         async function fetchCompactionSummaries() {
@@ -2702,8 +2767,23 @@
             }
         }
 
+        function closeCopyMenu() {
+            const menu = document.getElementById('copyMenu');
+            if (menu) menu.classList.remove('open');
+        }
+
+        function toggleCopyMenu(event) {
+            if (event) event.stopPropagation();
+            if (!svSelectedId) return;
+            const menu = document.getElementById('copyMenu');
+            if (menu) menu.classList.toggle('open');
+        }
+
         function buildSessionCopyText(allEvents, mode, compactionSummaries = []) {
             const blocks = [];
+            const includeTools = mode !== 'conversation';
+            const cleanMode = mode === 'clean' || mode === 'cleanest';
+            const cleanestMode = mode === 'cleanest';
 
             for (const ev of allEvents) {
                 if (ev.type === 'user') {
@@ -2716,13 +2796,20 @@
                         if (body) blocks.push('[' + kind + ']\n' + body);
                     }
 
-                    if (mode !== 'conversation' && ev.tool_results && ev.tool_results.length > 0) {
+                    if (includeTools && ev.tool_results && ev.tool_results.length > 0) {
                         for (const tr of ev.tool_results) {
                             const status = tr.is_error ? 'ERROR' : 'OK';
-                            const content = mode === 'compact'
-                                ? cleanClipboardText(tr.content)
-                                : stringifyClipboardValue(tr.content, true).trim();
-                            blocks.push('[TOOL RESULT ' + status + ']\n' + content);
+                            let content;
+                            if (cleanestMode) {
+                                content = summarizeCleanestText(tr.content, tr.is_error ? 1400 : 420, tr.is_error ? 40 : 10);
+                            } else if (cleanMode) {
+                                content = cleanClipboardText(tr.content, false);
+                            } else {
+                                content = stringifyClipboardValue(tr.content, true).trim();
+                            }
+                            blocks.push(content
+                                ? '[TOOL RESULT ' + status + ']\n' + content
+                                : '[TOOL RESULT ' + status + ']');
                         }
                     }
                 } else if (ev.type === 'assistant') {
@@ -2731,11 +2818,16 @@
                         if (body) blocks.push('ASSISTANT: ' + body);
                     }
 
-                    if (mode !== 'conversation' && ev.tool_uses && ev.tool_uses.length > 0) {
+                    if (includeTools && ev.tool_uses && ev.tool_uses.length > 0) {
                         for (const tu of ev.tool_uses) {
-                            const input = mode === 'compact'
-                                ? cleanClipboardText(tu.input)
-                                : stringifyClipboardValue(tu.input, true).trim();
+                            let input;
+                            if (cleanestMode) {
+                                input = summarizeCleanestText(tu.input, 700, 16);
+                            } else if (cleanMode) {
+                                input = cleanClipboardText(tu.input, false);
+                            } else {
+                                input = stringifyClipboardValue(tu.input, true).trim();
+                            }
                             blocks.push(input
                                 ? '[TOOL CALL ' + tu.name + ']\n' + input
                                 : '[TOOL CALL ' + tu.name + ']');
@@ -2747,14 +2839,16 @@
                 }
             }
 
-            if (mode !== 'conversation' && compactionSummaries.length > 0) {
+            if (includeTools && compactionSummaries.length > 0) {
                 blocks.push('=== COMPACTION SUMMARIES ===');
                 for (const item of compactionSummaries) {
                     const time = formatEventTime(item.timestamp);
                     const heading = 'Summary #' + item.index + (time ? ' [' + time + ']' : '');
-                    const body = mode === 'compact'
-                        ? cleanClipboardText(item.summary)
-                        : normalizeClipboardText(item.summary);
+                    const body = cleanestMode
+                        ? summarizeCleanestText(item.summary, 2000, 60)
+                        : (cleanMode
+                            ? cleanClipboardText(item.summary, false)
+                            : normalizeClipboardText(item.summary));
                     blocks.push(body ? heading + '\n' + body : heading);
                 }
             }
@@ -2822,6 +2916,7 @@
 
         async function copySession(mode = 'full', buttonId = 'copySessionBtn') {
             if (!svSelectedId) return;
+            closeCopyMenu();
             const btn = document.getElementById(buttonId);
             if (!btn) return;
             btn.disabled = true;
@@ -2887,6 +2982,26 @@
             btn.disabled = false;
         }
 
+        async function copyCurrentSessionId() {
+            const sessionId = svViewingSubagent || svSelectedId;
+            if (!sessionId) return;
+            const btn = document.getElementById('copySessionIdBtn');
+            if (!btn) return;
+            btn.disabled = true;
+            btn.textContent = 'Copied';
+
+            try {
+                await navigator.clipboard.writeText(sessionId);
+                setTimeout(() => { restoreActionButton(btn); }, 1500);
+            } catch (err) {
+                console.error('Copy session ID error:', err);
+                btn.textContent = 'Failed';
+                setTimeout(() => { restoreActionButton(btn); }, 1500);
+            }
+
+            btn.disabled = false;
+        }
+
         function updateConversationBadge() {
             const badge = document.getElementById('conversationBadge');
             if (svViewingSubagent) {
@@ -2897,9 +3012,8 @@
                 badge.textContent = (session?.status === 'active' ? 'LIVE' : 'Completed') + ' | ' + svEvents.length + ' events';
             }
             document.getElementById('exportSessionBtn').style.display = svSelectedId ? '' : 'none';
-            document.getElementById('copySessionBtn').style.display = svSelectedId ? '' : 'none';
-            document.getElementById('copyConversationBtn').style.display = svSelectedId ? '' : 'none';
-            document.getElementById('copyCompactBtn').style.display = svSelectedId ? '' : 'none';
+            document.getElementById('copySessionIdBtn').style.display = svSelectedId ? '' : 'none';
+            document.getElementById('copyMenuWrap').style.display = svSelectedId ? '' : 'none';
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -3431,6 +3545,10 @@
         document.getElementById('sessionDateFrom').addEventListener('change', fetchSessionList);
         document.getElementById('sessionDateTo').addEventListener('change', fetchSessionList);
         document.getElementById('loadMoreSessions').addEventListener('click', loadMoreSessions);
+        document.addEventListener('click', (event) => {
+            const wrap = document.getElementById('copyMenuWrap');
+            if (wrap && !wrap.contains(event.target)) closeCopyMenu();
+        });
 
         // ═══════════════════════════════════════════════════════════════
         // Initialize
