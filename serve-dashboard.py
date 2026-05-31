@@ -18,6 +18,25 @@ from collections import deque
 from datetime import datetime, timedelta
 import re
 
+# Suppress subprocess console windows on Windows (prevents screen flashing)
+if os.name == "nt":
+    _orig_subprocess_run = subprocess.run
+    _orig_subprocess_popen = subprocess.Popen
+
+    def _run_no_window(*args, **kwargs):
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return _orig_subprocess_run(*args, **kwargs)
+
+    class _PopenNoWindow(_orig_subprocess_popen):
+        def __init__(self, *args, **kwargs):
+            if "creationflags" not in kwargs:
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    subprocess.run = _run_no_window
+    subprocess.Popen = _PopenNoWindow
+
 PORT = 37778
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOG_DIR = SCRIPT_DIR / "logs"
@@ -104,6 +123,7 @@ PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
+CODEX_ARCHIVED_DIR = Path.home() / '.codex' / 'archived_sessions'
 _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 DROID_DIR = Path.home() / '.factory' / 'sessions'
@@ -111,6 +131,7 @@ DROID_DIR = Path.home() / '.factory' / 'sessions'
 # ─── WSL directory discovery ───────────────────────────────────────────────────
 WSL_PROJECTS_DIRS = []   # additional ~/.claude/projects from WSL distros
 WSL_CODEX_DIRS = []      # additional ~/.codex/sessions from WSL distros
+WSL_CODEX_ARCHIVED_DIRS = []  # additional ~/.codex/archived_sessions from WSL distros
 WSL_OPENCLAW_DIRS = []   # additional ~/.openclaw/agents from WSL distros
 WSL_KIMI_DIRS = []       # additional ~/.kimi/sessions from WSL distros
 WSL_DROID_DIRS = []      # additional ~/.factory/sessions from WSL distros
@@ -153,7 +174,8 @@ def _discover_wsl_homes():
 
 def _init_wsl_dirs():
     """Populate WSL_*_DIRS lists from discovered WSL home directories."""
-    global WSL_PROJECTS_DIRS, WSL_CODEX_DIRS, WSL_OPENCLAW_DIRS, WSL_KIMI_DIRS, WSL_DROID_DIRS
+    global WSL_PROJECTS_DIRS, WSL_CODEX_DIRS, WSL_CODEX_ARCHIVED_DIRS
+    global WSL_OPENCLAW_DIRS, WSL_KIMI_DIRS, WSL_DROID_DIRS
     for wsl_home in _discover_wsl_homes():
         proj = wsl_home / '.claude' / 'projects'
         if proj.exists():
@@ -161,6 +183,9 @@ def _init_wsl_dirs():
         codex = wsl_home / '.codex' / 'sessions'
         if codex.exists():
             WSL_CODEX_DIRS.append(codex)
+        codex_archived = wsl_home / '.codex' / 'archived_sessions'
+        if codex_archived.exists():
+            WSL_CODEX_ARCHIVED_DIRS.append(codex_archived)
         openclaw = wsl_home / '.openclaw' / 'agents'
         if openclaw.exists():
             WSL_OPENCLAW_DIRS.append(openclaw)
@@ -170,7 +195,11 @@ def _init_wsl_dirs():
         droid = wsl_home / '.factory' / 'sessions'
         if droid.exists():
             WSL_DROID_DIRS.append(droid)
-    total = len(WSL_PROJECTS_DIRS) + len(WSL_CODEX_DIRS) + len(WSL_OPENCLAW_DIRS) + len(WSL_KIMI_DIRS) + len(WSL_DROID_DIRS)
+    total = (
+        len(WSL_PROJECTS_DIRS) + len(WSL_CODEX_DIRS)
+        + len(WSL_CODEX_ARCHIVED_DIRS) + len(WSL_OPENCLAW_DIRS)
+        + len(WSL_KIMI_DIRS) + len(WSL_DROID_DIRS)
+    )
     if total:
         print(f"WSL: found {total} additional session directories")
 
@@ -179,7 +208,7 @@ try:
 except Exception as e:
     print(f"WSL discovery failed (non-fatal): {e}", file=sys.stderr)
 
-ALL_CODEX_DIRS = [CODEX_DIR] + WSL_CODEX_DIRS
+ALL_CODEX_DIRS = [CODEX_DIR, CODEX_ARCHIVED_DIR] + WSL_CODEX_DIRS + WSL_CODEX_ARCHIVED_DIRS
 
 MODEL_CONTEXT_WINDOWS = {
     'opus-4': 200_000,
@@ -305,7 +334,7 @@ class SessionIndex:
                     )
 
         # ── Scan ~/.codex/sessions/ (Windows + WSL) ────────────────────
-        for codex_dir in [CODEX_DIR] + WSL_CODEX_DIRS:
+        for codex_dir in [CODEX_DIR, CODEX_ARCHIVED_DIR] + WSL_CODEX_DIRS + WSL_CODEX_ARCHIVED_DIRS:
             if codex_dir.exists():
                 self._scan_codex_sessions(codex_dir, sessions, projects)
 
@@ -963,76 +992,107 @@ class SessionIndex:
 
     # ── Droid session scanning (.factory/sessions) ──────────────────────
 
+    @staticmethod
+    def _clean_droid_project_display(name):
+        display = name
+        if display.startswith('-home-dev-'):
+            display = display[10:]
+        elif display.startswith('-home-dev'):
+            display = display[9:] or 'home'
+        elif display.startswith('-home-k1-'):
+            display = display[9:]
+        elif display.startswith('-home-k1'):
+            display = display[8:] or 'home'
+        elif display.startswith('-mnt-c-'):
+            display = display[7:]
+        return 'droid/' + (display.replace('-', '/') if display else 'home')
+
+    @staticmethod
+    def _droid_display_from_cwd(cwd):
+        if not cwd:
+            return 'droid'
+        norm = cwd.replace('\\', '/').strip()
+        home = str(Path.home()).replace('\\', '/').rstrip('/') + '/'
+        if norm.startswith(home):
+            norm = norm[len(home):]
+        elif norm.startswith('/mnt/c/Users/Markus/'):
+            norm = norm[len('/mnt/c/Users/Markus/'):]
+        elif norm.startswith('/home/k1/'):
+            norm = norm[len('/home/k1/'):]
+        norm = norm.strip('/')
+        return 'droid/' + norm if norm else 'droid'
+
+    def _scan_droid_file(self, jsonl_file, display, sessions, projects):
+        sid_raw = jsonl_file.stem
+        if not re.match(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            sid_raw,
+        ):
+            return
+
+        try:
+            st = jsonl_file.stat()
+            mtime = st.st_mtime
+            size = st.st_size
+        except OSError:
+            return
+        if size == 0:
+            return
+
+        meta = self._extract_droid_metadata(jsonl_file, size)
+        if meta is None:
+            return
+
+        project_display = display or self._droid_display_from_cwd(meta.get('cwd', ''))
+        sid = 'droid-' + sid_raw
+        projects.add(project_display)
+
+        age = time.time() - mtime
+        active = age < 120
+
+        first_ts = meta.get('first_ts')
+        duration = int(mtime - first_ts) if first_ts else 0
+
+        last_input = meta.get('last_input_tokens', 0)
+        model = meta.get('model', '')
+        ctx_size = self._get_context_size(model)
+        context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
+        sessions[sid] = {
+            'sessionId': sid,
+            'project': project_display,
+            'source': 'droid',
+            'slug': meta.get('slug', ''),
+            'status': 'active' if active else 'completed',
+            'model': model,
+            'version': meta.get('version', ''),
+            'mtime': mtime,
+            'size': size,
+            'eventCount': meta.get('event_count', 0),
+            'cwd': meta.get('cwd', ''),
+            'gitBranch': meta.get('gitBranch', ''),
+            'subagentCount': 0,
+            'duration': duration,
+            'contextPct': context_pct,
+            '_path': str(jsonl_file),
+        }
+
     def _scan_droid_sessions(self, base_dir, sessions, projects):
-        """Scan ~/.factory/sessions/{project-dir}/ for UUID .jsonl files."""
+        """Scan ~/.factory/sessions/ for flat or project-nested UUID .jsonl files."""
         if not base_dir.exists():
             return
+
+        for jsonl_file in base_dir.glob('*.jsonl'):
+            self._scan_droid_file(jsonl_file, None, sessions, projects)
+
         for proj_dir in base_dir.iterdir():
             if not proj_dir.is_dir():
                 continue
 
-            proj_name = proj_dir.name
-            # Clean project display name (same encoding as Claude projects)
-            display = proj_name
-            if display.startswith('-home-dev-'):
-                display = display[10:]
-            elif display.startswith('-home-dev'):
-                display = display[9:] or 'home'
-            display = 'droid/' + (display.replace('-', '/') if display else 'home')
+            display = self._clean_droid_project_display(proj_dir.name)
 
             for jsonl_file in proj_dir.glob('*.jsonl'):
-                sid_raw = jsonl_file.stem
-                if not re.match(
-                    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-                    sid_raw,
-                ):
-                    continue
-
-                try:
-                    st = jsonl_file.stat()
-                    mtime = st.st_mtime
-                    size = st.st_size
-                except OSError:
-                    continue
-                if size == 0:
-                    continue
-
-                meta = self._extract_droid_metadata(jsonl_file, size)
-                if meta is None:
-                    continue
-
-                sid = 'droid-' + sid_raw
-                projects.add(display)
-
-                age = time.time() - mtime
-                active = age < 120
-
-                first_ts = meta.get('first_ts')
-                duration = int(mtime - first_ts) if first_ts else 0
-
-                last_input = meta.get('last_input_tokens', 0)
-                model = meta.get('model', '')
-                ctx_size = self._get_context_size(model)
-                context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
-
-                sessions[sid] = {
-                    'sessionId': sid,
-                    'project': display,
-                    'source': 'droid',
-                    'slug': meta.get('slug', ''),
-                    'status': 'active' if active else 'completed',
-                    'model': model,
-                    'version': meta.get('version', ''),
-                    'mtime': mtime,
-                    'size': size,
-                    'eventCount': meta.get('event_count', 0),
-                    'cwd': meta.get('cwd', ''),
-                    'gitBranch': meta.get('gitBranch', ''),
-                    'subagentCount': 0,
-                    'duration': duration,
-                    'contextPct': context_pct,
-                    '_path': str(jsonl_file),
-                }
+                self._scan_droid_file(jsonl_file, display, sessions, projects)
 
     @staticmethod
     def _extract_droid_metadata(path, size):
@@ -1108,6 +1168,14 @@ class SessionIndex:
                                     for block in content:
                                         if isinstance(block, dict) and block.get('type') == 'text':
                                             text = block.get('text', '').strip()
+                                            if text and not meta.get('cwd'):
+                                                m = re.search(r'Current folder:\s*([^\r\n]+)', text)
+                                                if m:
+                                                    meta['cwd'] = m.group(1).strip()
+                                            if text and not meta.get('gitBranch'):
+                                                m = re.search(r'Current branch:\s*([^\r\n]+)', text)
+                                                if m:
+                                                    meta['gitBranch'] = m.group(1).strip()
                                             if (text and len(text) <= 500
                                                     and not text.startswith('<')
                                                     and not text.startswith('#')):
@@ -1193,7 +1261,12 @@ class SessionIndex:
         if source in (None, 'codex'):
             if CODEX_DIR.exists():
                 dirs.append(str(CODEX_DIR))
+            if CODEX_ARCHIVED_DIR.exists():
+                dirs.append(str(CODEX_ARCHIVED_DIR))
             for d in WSL_CODEX_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
+            for d in WSL_CODEX_ARCHIVED_DIRS:
                 if d.exists():
                     dirs.append(str(d))
         if source in (None, 'kimi'):
@@ -1315,8 +1388,17 @@ class SessionIndex:
         if session_id.startswith('droid-'):
             raw_id = session_id[6:]
 
+        droid_bases = [DROID_DIR] + WSL_DROID_DIRS
         for base in [PROJECTS_DIR, DROID_DIR] + WSL_PROJECTS_DIRS + WSL_DROID_DIRS:
             if base.exists():
+                if base in droid_bases:
+                    p = (base / f'{raw_id}.jsonl').resolve()
+                    try:
+                        p.relative_to(base.resolve())
+                    except ValueError:
+                        p = None
+                    if p and p.exists():
+                        return str(p)
                 for d in base.iterdir():
                     if not d.is_dir():
                         continue
