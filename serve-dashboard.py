@@ -124,6 +124,7 @@ HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
 CODEX_ARCHIVED_DIR = Path.home() / '.codex' / 'archived_sessions'
+CODEX_INDEX_FILE = Path.home() / '.codex' / 'session_index.jsonl'
 _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 DROID_DIR = Path.home() / '.factory' / 'sessions'
@@ -651,6 +652,7 @@ class SessionIndex:
 
     def _scan_codex_sessions(self, base_dir, sessions, projects):
         """Scan ~/.codex/sessions/ for rollout-*.jsonl files."""
+        session_names = self._load_codex_session_names(base_dir)
         for jsonl_file in base_dir.rglob('rollout-*.jsonl'):
             try:
                 st = jsonl_file.stat()
@@ -665,7 +667,8 @@ class SessionIndex:
             if meta is None:
                 continue
 
-            sid = 'codex-' + meta.get('id', jsonl_file.stem)
+            raw_id = meta.get('id') or jsonl_file.stem
+            sid = 'codex-' + raw_id
             cwd = meta.get('cwd', '')
             # Project display: codex/ + relative cwd
             home_prefix = str(Path.home()) + '/'
@@ -690,7 +693,7 @@ class SessionIndex:
                 'sessionId': sid,
                 'project': display,
                 'source': 'codex',
-                'slug': meta.get('slug', ''),
+                'slug': session_names.get(raw_id) or meta.get('slug', ''),
                 'status': 'active' if active else 'completed',
                 'model': meta.get('model', ''),
                 'version': meta.get('version', ''),
@@ -704,6 +707,36 @@ class SessionIndex:
                 'contextPct': context_pct,
                 '_path': str(jsonl_file),
             }
+
+    @staticmethod
+    def _load_codex_session_names(base_dir):
+        """Load renamed Codex thread titles from ~/.codex/session_index.jsonl."""
+        index_file = CODEX_INDEX_FILE
+        try:
+            if base_dir != CODEX_DIR:
+                index_file = base_dir.parent / 'session_index.jsonl'
+        except OSError:
+            pass
+
+        names = {}
+        try:
+            with open(index_file, 'r', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sid = obj.get('id')
+                    name = obj.get('thread_name')
+                    clean_name = str(name).strip() if name else ''
+                    if sid and clean_name:
+                        names[sid] = clean_name
+        except OSError:
+            pass
+        return names
 
     @staticmethod
     def _extract_codex_metadata(path, size):
