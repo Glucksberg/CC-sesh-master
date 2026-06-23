@@ -2975,9 +2975,10 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         return history
 
     def log_message(self, format, *args):
-        if '/api/' not in args[0]:
+        request_line = str(args[0]) if args else format
+        if '/api/' not in request_line:
             return
-        print(f"[API] {args[0]}")
+        print(f"[API] {request_line}")
 
 
 # ─── Server ────────────────────────────────────────────────────────────────────
