@@ -1505,15 +1505,23 @@ class SessionEventReader:
         }
 
     @classmethod
-    def read_events(cls, path, after=None, limit=100, types=None, full=False):
+    def read_events(cls, path, after=None, before=None, limit=100, types=None, full=False):
         events = []
         try:
             file_size = os.path.getsize(path)
 
             if cls._is_codex_path(path):
-                events = cls._read_codex_events(path, file_size, after, limit, types)
+                events = cls._read_codex_events(
+                    path, file_size, after=after, before=before,
+                    limit=limit, types=types, full=full,
+                )
             elif cls._is_kimi_path(path):
-                events = cls._read_kimi_events(path, file_size, after, limit, types)
+                events = cls._read_kimi_events(
+                    path, file_size, after=after, before=before,
+                    limit=limit, types=types, full=full,
+                )
+            elif before:
+                events = cls._read_before_cursor(path, limit, types, before)
             elif after:
                 events = cls._read_after_cursor(path, file_size, after, limit, types)
             elif full:
@@ -1524,6 +1532,25 @@ class SessionEventReader:
             print(f"Error reading session: {e}", file=sys.stderr)
 
         return events
+
+    @classmethod
+    def _read_before_cursor(cls, path, limit, types, before):
+        """Read display events before a given UUID cursor."""
+        events = []
+        with open(path, 'r', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = cls._parse_event(line)
+                if not ev or ev['type'] in cls._SKIP_TYPES:
+                    continue
+                if types and ev['type'] not in types:
+                    continue
+                if ev.get('uuid') == before:
+                    break
+                events.append(ev)
+        return events[-limit:]
 
     @classmethod
     def _read_full(cls, path, limit, types):
@@ -1620,9 +1647,44 @@ class SessionEventReader:
     # ── Codex event reading ────────────────────────────────────────────────
 
     @classmethod
-    def _read_codex_events(cls, path, file_size, after=None, limit=100, types=None):
+    def _read_codex_events(cls, path, file_size, after=None, before=None,
+                           limit=100, types=None, full=False):
         """Read events from a Codex JSONL file using line-number cursors."""
         events = []
+
+        if full:
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                            if len(events) >= limit:
+                                break
+            return events
+
+        # Parse before cursor: "codex-<line_num>"
+        if before and before.startswith('codex-'):
+            try:
+                before_line = int(before.split('-', 1)[1])
+            except (ValueError, IndexError):
+                before_line = -1
+
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if line_num >= before_line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+            return events[-limit:]
 
         # Parse after cursor: "codex-<line_num>"
         if after and after.startswith('codex-'):
@@ -1888,9 +1950,46 @@ class SessionEventReader:
     # ── Kimi event reading ────────────────────────────────────────────────
 
     @classmethod
-    def _read_kimi_events(cls, path, file_size, after=None, limit=100, types=None):
+    def _read_kimi_events(cls, path, file_size, after=None, before=None,
+                          limit=100, types=None, full=False):
         """Read events from a Kimi wire.jsonl file using line-number cursors."""
         events = []
+
+        if full:
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                            if len(events) >= limit:
+                                break
+            return events
+
+        if before and before.startswith('kimi-'):
+            try:
+                before_line = int(before[5:])
+            except (ValueError, IndexError):
+                return events
+
+            if before_line < 0:
+                return events
+
+            with open(path, 'r', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if line_num >= before_line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+            return events[-limit:]
 
         if after and after.startswith('kimi-'):
             try:
@@ -1919,23 +2018,26 @@ class SessionEventReader:
                             break
             return events
 
-        # For large files, tail-read to avoid loading entire file
+        # For large files, tail-read but keep exact line-number cursors.
         if file_size > TAIL_READ_BYTES:
-            with open(path, 'rb') as f:
-                seek_back = min(file_size, TAIL_READ_BYTES)
-                f.seek(max(0, file_size - seek_back))
-                if file_size > seek_back:
-                    f.readline()  # skip partial line
-                tail = f.read().decode('utf-8', errors='replace')
-            est_start = max(0, round((file_size - TAIL_READ_BYTES) / 200))
-            for i, line in enumerate(tail.split('\n')):
-                line = line.strip()
-                if not line:
-                    continue
-                ev = cls._parse_kimi_event(line, est_start + i)
-                if ev and ev['type'] not in cls._SKIP_TYPES:
-                    if not types or ev['type'] in types:
-                        events.append(ev)
+            with open(path, 'r', errors='replace') as f:
+                f.seek(max(0, file_size - TAIL_READ_BYTES))
+                f.readline()
+                start_offset = f.tell()
+                f.seek(0)
+                line_offset = 0
+                while f.tell() < start_offset:
+                    f.readline()
+                    line_offset += 1
+                f.seek(start_offset)
+                for rel_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_offset + rel_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
             return events[-limit:]
 
         # Full scan for small files
@@ -2672,13 +2774,15 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             after = qs.get('after', [None])[0]
+            before = qs.get('before', [None])[0]
             full = qs.get('full', [''])[0] == '1'
             limit = min(int(qs.get('limit', ['100'])[0]), 10000 if full else 500)
             types_raw = qs.get('types', [None])[0]
             types = set(types_raw.split(',')) if types_raw else None
 
             events = SessionEventReader.read_events(
-                path, after=after, limit=limit, types=types, full=full,
+                path, after=after, before=before,
+                limit=limit, types=types, full=full,
             )
             self.send_json({'events': events, 'sessionId': session_id})
         except Exception as e:

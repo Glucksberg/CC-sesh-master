@@ -1373,6 +1373,19 @@
             color: var(--phosphor-green);
         }
 
+        .load-earlier-btn:disabled {
+            opacity: 0.6;
+            cursor: default;
+        }
+
+        .history-start {
+            margin: 0 auto 16px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.65rem;
+            text-align: center;
+        }
+
         /* Message bubbles */
         .msg-bubble {
             max-width: 90%;
@@ -1919,6 +1932,7 @@
         const POLL_INTERVAL = 2000;
         const SESSION_LIST_POLL = 1000;
         const SESSION_EVENTS_POLL = 1000;
+        const SESSION_HISTORY_BATCH = 500;
         const MAX_EVENTS = 100;
         const MAX_CHART_POINTS = 60;
         document.getElementById('endpointLabel').textContent = API_ORIGIN.replace(/^https?:\/\//, '');
@@ -1949,6 +1963,8 @@
         let svSelectedId = null;
         let svEvents = [];
         let svLastEventUUID = null;
+        let svHasMoreEarlier = true;
+        let svLoadingEarlier = false;
         let svAutoScroll = true;
         let svOffset = 0;
         let svTotal = 0;
@@ -2472,6 +2488,8 @@
             svSelectedId = id;
             svEvents = [];
             svLastEventUUID = null;
+            svHasMoreEarlier = true;
+            svLoadingEarlier = false;
             svAutoScroll = true;
             svViewingSubagent = null;
             svParentId = null;
@@ -2557,11 +2575,6 @@
                     svEvents = svEvents.concat(data.events);
                     svLastEventUUID = data.events[data.events.length - 1].uuid;
 
-                    // DOM limit
-                    if (svEvents.length > 500) {
-                        svEvents = svEvents.slice(-500);
-                    }
-
                     renderConversation();
                     updateConversationBadge();
                 }
@@ -2574,28 +2587,51 @@
 
         async function loadEarlierEvents() {
             if (!svSelectedId || svEvents.length === 0) return;
+            if (!svHasMoreEarlier || svLoadingEarlier) return;
             const targetId = svViewingSubagent || svSelectedId;
-            const firstUUID = svEvents[0].uuid;
-            // We need to fetch events before the first one
-            // The API reads from the end, so we fetch more and filter
+            svLoadingEarlier = true;
+            const btn = document.querySelector('.load-earlier-btn');
+            let loaded = 0;
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Loading full history...';
+            }
             try {
-                const res = await fetch(SESSION_API + '/' + targetId + '/events?limit=200');
-                if (!res.ok) return;
-                const data = await res.json();
-                const allEvents = data.events || [];
+                while (svHasMoreEarlier && svEvents.length > 0) {
+                    const firstUUID = svEvents[0].uuid;
+                    const url = SESSION_API + '/' + targetId + '/events?before=' +
+                        encodeURIComponent(firstUUID) + '&limit=' + SESSION_HISTORY_BATCH;
+                    const res = await fetch(url);
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
 
-                // Find events before our first event
-                const firstIdx = allEvents.findIndex(e => e.uuid === firstUUID);
-                if (firstIdx > 0) {
-                    const earlier = allEvents.slice(0, firstIdx);
-                    svEvents = earlier.concat(svEvents);
-                    if (svEvents.length > 500) {
-                        svEvents = svEvents.slice(-500);
+                    const data = await res.json();
+                    const earlier = data.events || [];
+                    if (earlier.length === 0) {
+                        svHasMoreEarlier = false;
+                        break;
                     }
-                    renderConversation(false); // Don't auto-scroll
+
+                    svEvents = earlier.concat(svEvents);
+                    loaded += earlier.length;
+                    if (btn) {
+                        btn.textContent = 'Loaded ' + loaded.toLocaleString() + ' older messages...';
+                    }
+                    if (earlier.length < SESSION_HISTORY_BATCH) {
+                        svHasMoreEarlier = false;
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 0));
                 }
+                renderConversation(false); // Don't auto-scroll
             } catch (err) {
                 console.error('Load earlier error:', err);
+                if (btn) btn.textContent = 'Load failed - retry';
+            } finally {
+                svLoadingEarlier = false;
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Load Full History';
+                }
             }
         }
 
@@ -3080,7 +3116,11 @@
                 html += renderEvent(svEvents[i]);
             }
 
-            html += '<button class="load-earlier-btn" onclick="loadEarlierEvents()">Load Earlier Messages</button>';
+            if (svHasMoreEarlier) {
+                html += '<button class="load-earlier-btn" onclick="loadEarlierEvents()">Load Full History</button>';
+            } else {
+                html += '<div class="history-start">Start of session</div>';
+            }
 
             viewer.innerHTML = html;
 
@@ -3092,7 +3132,7 @@
 
             if (autoScroll && svAutoScroll) {
                 viewer.scrollTop = 0;
-            } else if (openCards.size > 0) {
+            } else {
                 viewer.scrollTop = prevScroll;
             }
         }
@@ -3375,6 +3415,8 @@
             svParentId = svSelectedId;
             svEvents = [];
             svLastEventUUID = null;
+            svHasMoreEarlier = true;
+            svLoadingEarlier = false;
             svAutoScroll = true;
 
             // Update subagent list selection
@@ -3423,6 +3465,8 @@
             svParentId = svSelectedId;
             svEvents = [];
             svLastEventUUID = null;
+            svHasMoreEarlier = false;
+            svLoadingEarlier = false;
 
             document.querySelectorAll('.subagent-item').forEach(el => {
                 el.classList.toggle('selected', el.dataset.saId === sa.id);
