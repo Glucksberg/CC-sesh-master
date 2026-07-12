@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import threading
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from collections import deque
@@ -122,6 +123,8 @@ CLAUDE_DIR = Path.home() / '.claude'
 PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
+OPENCLAW_SQLITE_NAME = 'openclaw-agent.sqlite'
+OPENCLAW_SQLITE_PREFIX = 'openclaw-sqlite:'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
 CODEX_ARCHIVED_DIR = Path.home() / '.codex' / 'archived_sessions'
 CODEX_INDEX_FILE = Path.home() / '.codex' / 'session_index.jsonl'
@@ -265,7 +268,8 @@ class SessionIndex:
     def rebuild(self):
         sessions = {}
         subagents = {}      # parentId -> [subagent_info, ...]
-        subagent_paths = {} # filename_stem -> path str
+        subagent_paths = {} # subagent ID -> path str
+        codex_subagents = {}  # subagentId -> pending Codex subagent info
         projects = set()
 
         # ── Scan ~/.claude/projects/ ─────────────────────────────────
@@ -326,18 +330,29 @@ class SessionIndex:
                     if not agent_dir.is_dir():
                         continue
                     sess_dir = agent_dir / 'sessions'
-                    if not sess_dir.is_dir():
-                        continue
                     display = 'openclaw/' + agent_dir.name
-                    self._scan_session_dir(
-                        sess_dir, display, sessions, subagents,
-                        subagent_paths, projects, source='openclaw',
-                    )
+                    if sess_dir.is_dir():
+                        self._scan_session_dir(
+                            sess_dir, display, sessions, subagents,
+                            subagent_paths, projects, source='openclaw',
+                        )
+
+                    sqlite_path = agent_dir / 'agent' / OPENCLAW_SQLITE_NAME
+                    if sqlite_path.is_file():
+                        self._scan_openclaw_sqlite(
+                            sqlite_path, display, sessions, projects,
+                        )
 
         # ── Scan ~/.codex/sessions/ (Windows + WSL) ────────────────────
         for codex_dir in [CODEX_DIR, CODEX_ARCHIVED_DIR] + WSL_CODEX_DIRS + WSL_CODEX_ARCHIVED_DIRS:
             if codex_dir.exists():
-                self._scan_codex_sessions(codex_dir, sessions, projects)
+                self._scan_codex_sessions(
+                    codex_dir, sessions, projects, codex_subagents,
+                )
+
+        self._attach_codex_subagents(
+            sessions, subagents, subagent_paths, codex_subagents,
+        )
 
         # ── Scan ~/.kimi/sessions/ (Windows + WSL) ───────────────────
         for kimi_dir in [KIMI_DIR] + WSL_KIMI_DIRS:
@@ -429,6 +444,77 @@ class SessionIndex:
                 'duration': duration,
                 'contextPct': context_pct,
                 '_path': str(jsonl_file),
+            }
+
+    def _scan_openclaw_sqlite(self, db_path, display, sessions, projects):
+        """Scan sessions stored by newer OpenClaw releases in SQLite."""
+        try:
+            with sqlite3.connect(
+                f'file:{db_path}?mode=ro', uri=True, timeout=2,
+            ) as conn:
+                rows = conn.execute('''
+                    SELECT s.session_id, s.created_at, s.updated_at,
+                           s.started_at, s.ended_at, s.status,
+                           s.model_provider, s.model, s.display_name,
+                           COUNT(t.seq), COALESCE(SUM(LENGTH(t.event_json)), 0),
+                           json_extract(e.entry_json, '$.totalTokens'),
+                           json_extract(first_event.event_json, '$.cwd')
+                    FROM sessions s
+                    LEFT JOIN transcript_events t
+                      ON t.session_id = s.session_id
+                    LEFT JOIN session_entries e
+                      ON e.session_key = s.session_key
+                    LEFT JOIN transcript_events first_event
+                      ON first_event.session_id = s.session_id
+                     AND first_event.seq = 0
+                    GROUP BY s.session_id
+                ''').fetchall()
+        except (OSError, sqlite3.Error) as e:
+            print(f'OpenClaw SQLite scan failed for {db_path}: {e}', file=sys.stderr)
+            return
+
+        for row in rows:
+            (sid, created_ms, updated_ms, started_ms, ended_ms, raw_status,
+             provider, model, display_name, event_count, size,
+             total_tokens, cwd) = row
+            if not isinstance(sid, str) or not re.fullmatch(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                sid,
+            ):
+                continue
+
+            updated_ms = updated_ms or created_ms or 0
+            mtime = updated_ms / 1000
+            age = time.time() - mtime
+            terminal = raw_status in ('done', 'failed', 'killed', 'timeout')
+            active = age < 120 and not terminal
+            start_ms = started_ms or created_ms or updated_ms
+            end_ms = ended_ms or updated_ms
+            duration = max(0, int((end_ms - start_ms) / 1000))
+            full_model = model or ''
+            if provider and full_model and '/' not in full_model:
+                full_model = f'{provider}/{full_model}'
+            ctx_size = self._get_context_size(full_model)
+            context_pct = round((total_tokens / ctx_size) * 100) if ctx_size and total_tokens else 0
+
+            projects.add(display)
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'openclaw',
+                'slug': display_name or '',
+                'status': 'active' if active else 'completed',
+                'model': full_model,
+                'version': 'sqlite',
+                'mtime': mtime,
+                'size': size or 0,
+                'eventCount': event_count or 0,
+                'cwd': cwd or '',
+                'gitBranch': '',
+                'subagentCount': 0,
+                'duration': duration,
+                'contextPct': context_pct,
+                '_path': f'{OPENCLAW_SQLITE_PREFIX}{db_path}#{sid}',
             }
 
     # ── metadata helpers ──────────────────────────────────────────────────
@@ -650,7 +736,7 @@ class SessionIndex:
 
     # ── Codex session scanning ─────────────────────────────────────────────
 
-    def _scan_codex_sessions(self, base_dir, sessions, projects):
+    def _scan_codex_sessions(self, base_dir, sessions, projects, codex_subagents):
         """Scan ~/.codex/sessions/ for rollout-*.jsonl files."""
         session_names = self._load_codex_session_names(base_dir)
         for jsonl_file in base_dir.rglob('rollout-*.jsonl'):
@@ -668,6 +754,8 @@ class SessionIndex:
                 continue
 
             raw_id = meta.get('id') or jsonl_file.stem
+            if not isinstance(raw_id, str):
+                raw_id = jsonl_file.stem
             sid = 'codex-' + raw_id
             cwd = meta.get('cwd', '')
             # Project display: codex/ + relative cwd
@@ -689,7 +777,7 @@ class SessionIndex:
             ctx_size = self._get_context_size(model)
             context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
 
-            sessions[sid] = {
+            session = {
                 'sessionId': sid,
                 'project': display,
                 'source': 'codex',
@@ -707,6 +795,83 @@ class SessionIndex:
                 'contextPct': context_pct,
                 '_path': str(jsonl_file),
             }
+
+            parent_raw_id = meta.get('parent_thread_id') or meta.get('forked_from_id')
+            if (meta.get('thread_source') == 'subagent'
+                    and isinstance(parent_raw_id, str) and parent_raw_id):
+                parent_id = (parent_raw_id if parent_raw_id.startswith('codex-')
+                             else 'codex-' + parent_raw_id)
+                agent_path = meta.get('agent_path', '')
+                if not isinstance(agent_path, str):
+                    agent_path = ''
+                agent_nickname = meta.get('agent_nickname', '')
+                if not isinstance(agent_nickname, str):
+                    agent_nickname = ''
+                agent_label = agent_path.strip('/').rsplit('/', 1)[-1] if agent_path else ''
+                if agent_nickname:
+                    agent_label = (f'{agent_label} ({agent_nickname})'
+                                   if agent_label else agent_nickname)
+
+                codex_subagents[sid] = {
+                    'parentId': parent_id,
+                    'session': session,
+                    'subagent': {
+                        'id': sid,
+                        'parentId': parent_id,
+                        'agentType': 'codex-subagent',
+                        'filename': jsonl_file.name,
+                        'size': size,
+                        'mtime': mtime,
+                        'eventCount': meta.get('event_count', 0),
+                        'slug': agent_label or meta.get('slug', ''),
+                        'model': model,
+                        'status': session['status'],
+                        'agentPath': agent_path,
+                    },
+                }
+                continue
+
+            sessions[sid] = session
+
+    @staticmethod
+    def _attach_codex_subagents(sessions, subagents, subagent_paths,
+                                codex_subagents):
+        """Attach Codex subagents to their nearest indexed parent session."""
+        root_session_ids = set(sessions)
+
+        def find_parent_id(parent_id):
+            seen = set()
+            while parent_id not in root_session_ids:
+                if parent_id in seen:
+                    return None
+                seen.add(parent_id)
+                parent = codex_subagents.get(parent_id)
+                if not parent:
+                    return None
+                parent_id = parent['parentId']
+            return parent_id
+
+        for candidate in codex_subagents.values():
+            parent_id = find_parent_id(candidate['parentId'])
+            if not parent_id:
+                # Keep orphaned subagents visible rather than losing their history.
+                session = candidate['session']
+                sessions[session['sessionId']] = session
+                continue
+
+            subagent = dict(candidate['subagent'])
+            subagent['parentId'] = parent_id
+            children = subagents.setdefault(parent_id, [])
+            if any(existing.get('id') == subagent['id'] for existing in children):
+                continue
+            children.append(subagent)
+            subagent_paths[subagent['id']] = candidate['session']['_path']
+
+        for parent_id, children in subagents.items():
+            parent = sessions.get(parent_id)
+            if parent and parent.get('source') == 'codex':
+                children.sort(key=lambda child: child.get('mtime', 0), reverse=True)
+                parent['subagentCount'] = len(children)
 
     @staticmethod
     def _load_codex_session_names(base_dir):
@@ -778,6 +943,13 @@ class SessionIndex:
                             # id and cause the parent session to be shadowed.
                             if 'id' not in meta:
                                 meta['id'] = payload.get('id', '')
+                                for key in (
+                                    'thread_source', 'parent_thread_id',
+                                    'forked_from_id', 'agent_path', 'agent_nickname',
+                                ):
+                                    value = payload.get(key)
+                                    if isinstance(value, str):
+                                        meta[key] = value
                             if not meta.get('cwd'):
                                 meta['cwd'] = payload.get('cwd', '')
                             if not meta.get('version'):
@@ -1346,6 +1518,38 @@ class SessionIndex:
             if sid:
                 matched_ids.add(sid)
 
+        # Newer OpenClaw sessions live in SQLite and cannot be searched by rg.
+        if source in (None, 'openclaw'):
+            sqlite_dbs = {}
+            with self._lock:
+                indexed = list(self._sessions.items())
+            for sid, session in indexed:
+                ref = session.get('_path', '')
+                if not ref.startswith(OPENCLAW_SQLITE_PREFIX):
+                    continue
+                try:
+                    db_path, ref_sid = ref[len(OPENCLAW_SQLITE_PREFIX):].rsplit('#', 1)
+                except ValueError:
+                    continue
+                sqlite_dbs.setdefault(db_path, {})[ref_sid] = sid
+
+            for db_path, db_sessions in sqlite_dbs.items():
+                try:
+                    with sqlite3.connect(
+                        f'file:{db_path}?mode=ro', uri=True, timeout=2,
+                    ) as conn:
+                        rows = conn.execute(
+                            'SELECT DISTINCT session_id FROM transcript_events '
+                            'WHERE instr(event_json, ?) > 0',
+                            (query,),
+                        ).fetchall()
+                    for (ref_sid,) in rows:
+                        sid = db_sessions.get(ref_sid)
+                        if sid:
+                            matched_ids.add(sid)
+                except (OSError, sqlite3.Error):
+                    continue
+
         self._content_cache[cache_key] = {'ids': matched_ids, 'time': time.time()}
         return matched_ids
 
@@ -1466,6 +1670,43 @@ class SessionEventReader:
     ])
 
     @staticmethod
+    def _openclaw_sqlite_ref(path):
+        """Return (database path, session ID) for an internal SQLite ref."""
+        value = str(path)
+        if not value.startswith(OPENCLAW_SQLITE_PREFIX):
+            return None
+        try:
+            db_path, session_id = value[len(OPENCLAW_SQLITE_PREFIX):].rsplit('#', 1)
+        except ValueError:
+            return None
+        if not db_path or not re.fullmatch(
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+            session_id,
+        ):
+            return None
+        return db_path, session_id
+
+    @classmethod
+    def _raw_event_lines(cls, path):
+        """Yield raw event JSON from either a JSONL file or OpenClaw SQLite."""
+        sqlite_ref = cls._openclaw_sqlite_ref(path)
+        if sqlite_ref:
+            db_path, session_id = sqlite_ref
+            with sqlite3.connect(
+                f'file:{db_path}?mode=ro', uri=True, timeout=2,
+            ) as conn:
+                for row in conn.execute(
+                    'SELECT event_json FROM transcript_events '
+                    'WHERE session_id = ? ORDER BY seq',
+                    (session_id,),
+                ):
+                    yield row[0]
+            return
+
+        with open(path, 'r', errors='replace') as f:
+            yield from f
+
+    @staticmethod
     def _is_codex_path(path):
         """Check if path is under any Codex sessions directory (Windows or WSL)."""
         s = str(path)
@@ -1508,6 +1749,12 @@ class SessionEventReader:
     def read_events(cls, path, after=None, before=None, limit=100, types=None, full=False):
         events = []
         try:
+            if cls._openclaw_sqlite_ref(path):
+                return cls._read_openclaw_sqlite_events(
+                    path, after=after, before=before, limit=limit,
+                    types=types, full=full,
+                )
+
             file_size = os.path.getsize(path)
 
             if cls._is_codex_path(path):
@@ -1528,9 +1775,64 @@ class SessionEventReader:
                 events = cls._read_full(path, limit, types)
             else:
                 events = cls._read_tail(path, file_size, limit, types)
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             print(f"Error reading session: {e}", file=sys.stderr)
 
+        return events
+
+    @classmethod
+    def _read_openclaw_sqlite_events(cls, path, after=None, before=None,
+                                     limit=100, types=None, full=False):
+        """Read OpenClaw transcript events using stable sequence cursors."""
+        db_path, session_id = cls._openclaw_sqlite_ref(path)
+        clauses = ['session_id = ?']
+        params = [session_id]
+        reverse = False
+
+        if before and before.startswith('ocsql-'):
+            try:
+                clauses.append('seq < ?')
+                params.append(int(before[6:]))
+            except ValueError:
+                return []
+            order = 'DESC'
+            reverse = True
+        elif after and after.startswith('ocsql-'):
+            try:
+                clauses.append('seq > ?')
+                params.append(int(after[6:]))
+            except ValueError:
+                return []
+            order = 'ASC'
+        elif full:
+            order = 'ASC'
+        else:
+            order = 'DESC'
+            reverse = True
+
+        with sqlite3.connect(
+            f'file:{db_path}?mode=ro', uri=True, timeout=2,
+        ) as conn:
+            rows = conn.execute(
+                'SELECT seq, event_json FROM transcript_events WHERE '
+                + ' AND '.join(clauses) + f' ORDER BY seq {order}',
+                params,
+            ).fetchall()
+
+        events = []
+        for seq, line in rows:
+            ev = cls._parse_event(line)
+            if not ev or ev['type'] in cls._SKIP_TYPES:
+                continue
+            if types and ev['type'] not in types:
+                continue
+            ev['uuid'] = f'ocsql-{seq}'
+            events.append(ev)
+            if not reverse and len(events) >= limit:
+                break
+
+        if reverse:
+            events = list(reversed(events[:limit]))
         return events
 
     @classmethod
@@ -2331,8 +2633,8 @@ class SessionEventReader:
 
     # ── inline subagent scanning (OpenClaw sessions_spawn) ──────────────
 
-    @staticmethod
-    def scan_inline_subagents(path):
+    @classmethod
+    def scan_inline_subagents(cls, path):
         """Parse sessions_spawn tool calls to find ephemeral subagents.
 
         OpenClaw subagents are spawned via the sessions_spawn tool and don't
@@ -2343,60 +2645,59 @@ class SessionEventReader:
         results = {} # toolCallId -> {status, childSessionKey, runId, error}
 
         try:
-            with open(path, 'r', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or 'sessions_spawn' not in line:
-                        continue
-                    try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            for line in cls._raw_event_lines(path):
+                line = line.strip()
+                if not line or 'sessions_spawn' not in line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    msg = raw.get('message', {})
-                    role = msg.get('role', '')
-                    content = msg.get('content', [])
-                    ts = raw.get('timestamp', '')
+                msg = raw.get('message', {})
+                role = msg.get('role', '')
+                content = msg.get('content', [])
+                ts = raw.get('timestamp', '')
 
-                    # Assistant message with toolCall blocks
+                # Assistant message with toolCall blocks
+                if isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict)
+                                and block.get('type') == 'toolCall'
+                                and block.get('name') == 'sessions_spawn'):
+                            cid = block.get('id', '')
+                            args = block.get('arguments', {})
+                            calls[cid] = {
+                                'task': args.get('task', ''),
+                                'model': args.get('model', ''),
+                                'mode': args.get('mode', 'run'),
+                                'timestamp': ts,
+                            }
+
+                # toolResult role
+                if role == 'toolResult' and msg.get('toolName') == 'sessions_spawn':
+                    tcid = msg.get('toolCallId', '')
+                    rc = ''
                     if isinstance(content, list):
-                        for block in content:
-                            if (isinstance(block, dict)
-                                    and block.get('type') == 'toolCall'
-                                    and block.get('name') == 'sessions_spawn'):
-                                cid = block.get('id', '')
-                                args = block.get('arguments', {})
-                                calls[cid] = {
-                                    'task': args.get('task', ''),
-                                    'model': args.get('model', ''),
-                                    'mode': args.get('mode', 'run'),
-                                    'timestamp': ts,
-                                }
+                        for b in content:
+                            if isinstance(b, dict) and b.get('type') == 'text':
+                                rc = b.get('text', '')
+                                break
+                    elif isinstance(content, str):
+                        rc = content
+                    if rc:
+                        try:
+                            parsed = json.loads(rc)
+                            results[tcid] = {
+                                'status': parsed.get('status', ''),
+                                'childSessionKey': parsed.get('childSessionKey', ''),
+                                'runId': parsed.get('runId', ''),
+                                'error': parsed.get('error', ''),
+                            }
+                        except (json.JSONDecodeError, KeyError):
+                            pass
 
-                    # toolResult role
-                    if role == 'toolResult' and msg.get('toolName') == 'sessions_spawn':
-                        tcid = msg.get('toolCallId', '')
-                        rc = ''
-                        if isinstance(content, list):
-                            for b in content:
-                                if isinstance(b, dict) and b.get('type') == 'text':
-                                    rc = b.get('text', '')
-                                    break
-                        elif isinstance(content, str):
-                            rc = content
-                        if rc:
-                            try:
-                                parsed = json.loads(rc)
-                                results[tcid] = {
-                                    'status': parsed.get('status', ''),
-                                    'childSessionKey': parsed.get('childSessionKey', ''),
-                                    'runId': parsed.get('runId', ''),
-                                    'error': parsed.get('error', ''),
-                                }
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-
-        except OSError:
+        except (OSError, sqlite3.Error):
             return []
 
         # Build subagent list from paired calls + results (accepted only)
@@ -2437,9 +2738,28 @@ class SessionEventReader:
 
     # ── raw event & stats ─────────────────────────────────────────────────
 
-    @staticmethod
-    def get_raw_event(path, event_uuid):
+    @classmethod
+    def get_raw_event(cls, path, event_uuid):
         try:
+            sqlite_ref = cls._openclaw_sqlite_ref(path)
+            if sqlite_ref:
+                if not event_uuid.startswith('ocsql-'):
+                    return None
+                try:
+                    seq = int(event_uuid[6:])
+                except ValueError:
+                    return None
+                db_path, session_id = sqlite_ref
+                with sqlite3.connect(
+                    f'file:{db_path}?mode=ro', uri=True, timeout=2,
+                ) as conn:
+                    row = conn.execute(
+                        'SELECT event_json FROM transcript_events '
+                        'WHERE session_id = ? AND seq = ?',
+                        (session_id, seq),
+                    ).fetchone()
+                return json.loads(row[0]) if row else None
+
             # Codex/Kimi: line-number based lookup
             for prefix in ('codex-', 'kimi-'):
                 if event_uuid.startswith(prefix):
@@ -2475,12 +2795,12 @@ class SessionEventReader:
                             return obj
                     except json.JSONDecodeError:
                         pass
-        except OSError:
+        except (OSError, sqlite3.Error, json.JSONDecodeError):
             pass
         return None
 
-    @staticmethod
-    def get_stats(path):
+    @classmethod
+    def get_stats(cls, path):
         stats = {
             'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
             'tokens': {
@@ -2496,37 +2816,37 @@ class SessionEventReader:
         first_ts = last_ts = None
 
         try:
-            with open(path, 'r', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            for line in cls._raw_event_lines(path):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    et = raw.get('type', '')
-                    stats['event_counts'][et] = stats['event_counts'].get(et, 0) + 1
+                et = raw.get('type', '')
+                stats['event_counts'][et] = stats['event_counts'].get(et, 0) + 1
 
-                    ts = raw.get('timestamp', '')
-                    if ts:
-                        if isinstance(ts, (int, float)):
-                            ts = datetime.fromtimestamp(
-                                ts / 1000 if ts > 1e12 else ts
-                            ).isoformat()
-                        if first_ts is None:
-                            first_ts = ts
-                        last_ts = ts
+                ts = raw.get('timestamp', '')
+                if ts:
+                    if isinstance(ts, (int, float)):
+                        ts = datetime.fromtimestamp(
+                            ts / 1000 if ts > 1e12 else ts
+                        ).isoformat()
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
 
-                    if not stats['cwd'] and raw.get('cwd'):
-                        stats['cwd'] = raw['cwd']
-                    if not stats['gitBranch'] and raw.get('gitBranch'):
-                        stats['gitBranch'] = raw['gitBranch']
-                    if not stats['version'] and raw.get('version'):
-                        stats['version'] = str(raw['version'])
+                if not stats['cwd'] and raw.get('cwd'):
+                    stats['cwd'] = raw['cwd']
+                if not stats['gitBranch'] and raw.get('gitBranch'):
+                    stats['gitBranch'] = raw['gitBranch']
+                if not stats['version'] and raw.get('version'):
+                    stats['version'] = str(raw['version'])
 
-                    msg = raw.get('message', {})
+                msg = raw.get('message', {})
+                if isinstance(msg, dict):
 
                     # Claude Code native: type == 'assistant'
                     if et == 'assistant':
@@ -2641,7 +2961,7 @@ class SessionEventReader:
                         name = raw.get('name', '') or (raw.get('payload') or {}).get('name', 'unknown')
                         stats['tool_calls'][name] = stats['tool_calls'].get(name, 0) + 1
 
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             print(f"Error reading stats: {e}", file=sys.stderr)
 
         stats['first_timestamp'] = first_ts or ''
