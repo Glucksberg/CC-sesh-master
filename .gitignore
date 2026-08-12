@@ -5,3 +5,8 @@ logs/*.md
 __pycache__/
 *.pyc
 .DS_Store
+
+# Credenciais nunca entram neste repositório (é público)
+.env
+*.env
+!*.env.example
