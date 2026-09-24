@@ -38,6 +38,7 @@ pm2 save
 
 ### Session Viewer
 - Browse 1000+ sessions across all projects
+- Claude Code session titles (`customTitle` or `aiTitle`) in the list; session ID fallback when no title exists
 - Filter by project, status (active/completed), date range, search
 - Real-time conversation view with auto-scroll
 - Collapsible tool call cards with input/output
@@ -48,6 +49,9 @@ pm2 save
 - Navigate into subagent conversations with back-to-parent navigation
 - Export any session or subagent conversation to Markdown
 - **OpenClaw integration** — auto-discovers sessions from `~/.openclaw/agents/*/sessions/` with full event parsing
+- **Hermes benchmark runs** — shows eval runs from Hermes agent benchmark projects on WSL (`*/workspace/projects/*/results/<run>/`), with progress, per-sample Q&A and final score
+- **Hermes Agent sessions** — conversation sessions from `~/.hermes/sessions/*.json` plus the live SessionDB (`state.db`) read through a bridge script executed inside WSL (`hermes_state_bridge.py`), with tool calls, tokens and real-time activity
+- **OpenCode integration** — sessions from OpenCode's SQLite store (`~/.local/share/opencode/opencode.db`) plus the legacy JSON store (`storage/`), with tool calls and results
 
 ## Architecture
 
@@ -88,6 +92,8 @@ Use `after=<uuid>` for cursor-based incremental updates. The server reads from t
 - **Session files:** `~/.claude/projects/<project>/<sessionId>.jsonl`
 - **Subagent files:** `~/.claude/projects/<project>/<sessionId>/subagents/*.jsonl`
 - **OpenClaw sessions:** `~/.openclaw/agents/<agent>/sessions/<sessionId>.jsonl`
+- **Hermes bench runs:** `<wsl-home>/*/workspace/projects/*/results/<run>/` (override with `HERMES_BENCH_DIRS` env var, `os.pathsep`-separated)
+- **OpenCode sessions:** `~/.local/share/opencode/opencode.db` (SQLite) + legacy `storage/` JSON store
 - **Process events:** `logs/events_YYYYMMDD.jsonl` (written by claude-tracker.sh)
 
 ## Session Migration Notes

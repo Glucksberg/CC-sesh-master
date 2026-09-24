@@ -10,8 +10,11 @@ import json
 import subprocess
 import os
 import sys
+import ctypes
 import time
 import threading
+import shutil
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 from collections import deque
@@ -51,7 +54,7 @@ def _write_event(event_dict):
     today = datetime.now().strftime('%Y%m%d')
     event_file = LOG_DIR / f'events_{today}.jsonl'
     try:
-        with open(event_file, 'a') as f:
+        with open(event_file, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event_dict) + '\n')
     except (OSError, IOError) as e:
         print(f"Warning: Could not write event: {e}", file=sys.stderr)
@@ -127,6 +130,8 @@ CODEX_ARCHIVED_DIR = Path.home() / '.codex' / 'archived_sessions'
 _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 DROID_DIR = Path.home() / '.factory' / 'sessions'
+OPENCODE_DB = Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db'
+OPENCODE_STORAGE_DIR = Path.home() / '.local' / 'share' / 'opencode' / 'storage'
 
 # ─── WSL directory discovery ───────────────────────────────────────────────────
 WSL_PROJECTS_DIRS = []   # additional ~/.claude/projects from WSL distros
@@ -135,6 +140,30 @@ WSL_CODEX_ARCHIVED_DIRS = []  # additional ~/.codex/archived_sessions from WSL d
 WSL_OPENCLAW_DIRS = []   # additional ~/.openclaw/agents from WSL distros
 WSL_KIMI_DIRS = []       # additional ~/.kimi/sessions from WSL distros
 WSL_DROID_DIRS = []      # additional ~/.factory/sessions from WSL distros
+WSL_HOMES = []           # discovered WSL home paths (//wsl.localhost/<distro>/home/...)
+HERMES_BENCH_DIRS = []   # dirs holding eval run folders (e.g. <project>/results)
+HERMES_SESSION_DIRS = [] # ~/.hermes/sessions (Windows + WSL homes)
+HERMES_STATE = None      # {'distro': ..., 'db': ...} live SessionDB in WSL
+
+def _discover_wsl_distros():
+    """List installed WSL distro names (docker-desktop filtered out)."""
+    if sys.platform != 'win32':
+        return []
+    try:
+        result = subprocess.run(
+            ['wsl', '-l', '-q'], capture_output=True, timeout=5,
+        )
+        raw = result.stdout
+        try:
+            text = raw.decode('utf-16-le')
+        except (UnicodeDecodeError, ValueError):
+            text = raw.decode('utf-8', errors='replace')
+        distros = [d.strip().strip('\x00') for d in text.splitlines()
+                   if d.strip().strip('\x00')]
+        return [d for d in distros if 'docker' not in d.lower()]
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return []
+
 
 def _discover_wsl_homes():
     """Discover home directories from installed WSL distros."""
@@ -175,8 +204,9 @@ def _discover_wsl_homes():
 def _init_wsl_dirs():
     """Populate WSL_*_DIRS lists from discovered WSL home directories."""
     global WSL_PROJECTS_DIRS, WSL_CODEX_DIRS, WSL_CODEX_ARCHIVED_DIRS
-    global WSL_OPENCLAW_DIRS, WSL_KIMI_DIRS, WSL_DROID_DIRS
-    for wsl_home in _discover_wsl_homes():
+    global WSL_OPENCLAW_DIRS, WSL_KIMI_DIRS, WSL_DROID_DIRS, WSL_HOMES
+    WSL_HOMES = _discover_wsl_homes()
+    for wsl_home in WSL_HOMES:
         proj = wsl_home / '.claude' / 'projects'
         if proj.exists():
             WSL_PROJECTS_DIRS.append(proj)
@@ -203,12 +233,135 @@ def _init_wsl_dirs():
     if total:
         print(f"WSL: found {total} additional session directories")
 
+def _init_hermes_bench_dirs():
+    """Populate HERMES_BENCH_DIRS with dirs that hold eval run folders.
+
+    Each entry is a directory whose subdirectories are individual runs
+    (e.g. <project>/results/<run-name>/). Override with the HERMES_BENCH_DIRS
+    env var (os.pathsep-separated).
+    """
+    global HERMES_BENCH_DIRS
+    env = os.environ.get('HERMES_BENCH_DIRS', '').strip()
+    if env:
+        for part in env.split(os.pathsep):
+            p = Path(part.strip())
+            if p.is_dir():
+                HERMES_BENCH_DIRS.append(p)
+        return
+    for wsl_home in WSL_HOMES:
+        for cand in sorted(wsl_home.glob('*/workspace/projects/*/results')):
+            if cand.is_dir():
+                HERMES_BENCH_DIRS.append(cand)
+    if HERMES_BENCH_DIRS:
+        print(f"Hermes bench: found {len(HERMES_BENCH_DIRS)} run directories")
+
+def _init_hermes_session_dirs():
+    """Populate HERMES_SESSION_DIRS with ~/.hermes/sessions locations.
+
+    On WSL, ~/.hermes is often a symlink (e.g. into a sandbox home) that the
+    //wsl.localhost file sharing does not follow, so a couple of common
+    real-path candidates are probed as fallback. Override everything with the
+    HERMES_SESSION_DIRS env var (os.pathsep-separated).
+    """
+    global HERMES_SESSION_DIRS, HERMES_STATE
+    env = os.environ.get('HERMES_SESSION_DIRS', '').strip()
+    cands = []
+    if env:
+        cands = [Path(p.strip()) for p in env.split(os.pathsep) if p.strip()]
+    else:
+        local = Path.home() / '.hermes' / 'sessions'
+        if local.is_dir():
+            cands.append(local)
+        for wsl_home in WSL_HOMES:
+            cands.extend([
+                wsl_home / '.hermes' / 'sessions',
+                wsl_home / 'hermes-cristalina-sandbox' / 'home' / 'sessions',
+            ])
+    for c in cands:
+        if c.is_dir() and c not in HERMES_SESSION_DIRS:
+            HERMES_SESSION_DIRS.append(c)
+    if HERMES_SESSION_DIRS:
+        print(f"Hermes sessions: found {len(HERMES_SESSION_DIRS)} session directories")
+
+    # Locate the live SessionDB (state.db) inside WSL distros. It is read
+    # through a bridge script executed inside WSL — the 3GB+ database must
+    # not be touched over the 9P file share.
+    for distro in _discover_wsl_distros():
+        try:
+            probe = subprocess.run(
+                ['wsl', '-d', distro, '-e', 'bash', '-c',
+                 '[ -f ~/.hermes/state.db ] && echo OK'],
+                capture_output=True, text=True, timeout=8,
+            )
+            if 'OK' not in (probe.stdout or ''):
+                continue
+            path = subprocess.run(
+                ['wsl', '-d', distro, '-e', 'bash', '-c',
+                 'readlink -f ~/.hermes/state.db'],
+                capture_output=True, text=True, timeout=8,
+            ).stdout.strip()
+            if path:
+                HERMES_STATE = {'distro': distro, 'db': path}
+                print(f"Hermes state.db: {distro}:{path}")
+                break
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
 try:
     _init_wsl_dirs()
 except Exception as e:
     print(f"WSL discovery failed (non-fatal): {e}", file=sys.stderr)
 
+try:
+    _init_hermes_bench_dirs()
+except Exception as e:
+    print(f"Hermes bench discovery failed (non-fatal): {e}", file=sys.stderr)
+
+try:
+    _init_hermes_session_dirs()
+except Exception as e:
+    print(f"Hermes session discovery failed (non-fatal): {e}", file=sys.stderr)
+
+
+def _wsl_hermes_bridge(args, timeout=15):
+    """Run hermes_state_bridge.py inside WSL and return parsed JSON."""
+    if not HERMES_STATE:
+        return None
+    p = str(SCRIPT_DIR / 'hermes_state_bridge.py').replace('\\', '/')
+    m = re.match(r'([A-Za-z]):/(.*)', p)
+    if not m:
+        return None
+    wsl_script = f'/mnt/{m.group(1).lower()}/{m.group(2)}'
+    cmd = (['wsl', '-d', HERMES_STATE['distro'], '-e', 'python3',
+            wsl_script, HERMES_STATE['db']]
+           + [str(a) for a in args])
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            encoding='utf-8', errors='replace',
+        )
+        out = (result.stdout or '').strip()
+        if result.returncode != 0 or not out:
+            return None
+        return json.loads(out)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError, ValueError):
+        return None
+
 ALL_CODEX_DIRS = [CODEX_DIR, CODEX_ARCHIVED_DIR] + WSL_CODEX_DIRS + WSL_CODEX_ARCHIVED_DIRS
+
+def _find_rg():
+    """Locate a ripgrep binary (PATH first, then known bundled copies)."""
+    exe = shutil.which('rg')
+    if exe:
+        return exe
+    for cand in (
+        Path.home() / '.local' / 'share' / 'opencode' / 'bin' / 'rg.exe',
+        Path.home() / 'scoop' / 'shims' / 'rg.exe',
+    ):
+        if cand.exists():
+            return str(cand)
+    return None
 
 MODEL_CONTEXT_WINDOWS = {
     'opus-4': 200_000,
@@ -348,6 +501,28 @@ class SessionIndex:
             if droid_dir.exists():
                 self._scan_droid_sessions(droid_dir, sessions, projects)
 
+        # ── Scan Hermes eval runs (WSL + HERMES_BENCH_DIRS) ──────────
+        for bench_dir in HERMES_BENCH_DIRS:
+            if bench_dir.exists():
+                self._scan_hermes_bench_runs(bench_dir, sessions, projects)
+
+        # Hermes agent conversation sessions (Windows + WSL)
+        for hermes_dir in HERMES_SESSION_DIRS:
+            if hermes_dir.exists():
+                self._scan_hermes_sessions(hermes_dir, sessions, projects)
+
+        # Live Hermes SessionDB (state.db inside WSL)
+        if HERMES_STATE:
+            self._scan_hermes_state_sessions(sessions, projects)
+
+        # ── Scan OpenCode sessions (SQLite) ─────────────────────────
+        if OPENCODE_DB.exists():
+            self._scan_opencode_sessions(sessions, projects)
+        legacy_sess_dir = OPENCODE_STORAGE_DIR / 'session'
+        if legacy_sess_dir.is_dir():
+            self._scan_opencode_legacy_sessions(legacy_sess_dir, sessions,
+                                                projects)
+
         with self._lock:
             self._sessions = sessions
             self._subagents = subagents
@@ -376,7 +551,7 @@ class SessionIndex:
             if size == 0:
                 continue
 
-            meta = self._extract_metadata(jsonl_file, size)
+            meta = self._extract_metadata(jsonl_file, size, source)
             if meta is None:
                 continue
 
@@ -444,13 +619,13 @@ class SessionIndex:
         return MODEL_CONTEXT_DEFAULT
 
     @staticmethod
-    def _extract_metadata(path, size):
+    def _extract_metadata(path, size, source='claude'):
         meta = {'event_count': max(1, size // 500)}
 
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 # First few lines
-                for _ in range(8):
+                for _ in range(64 if source == 'claude' else 8):
                     line = f.readline()
                     if not line:
                         break
@@ -477,6 +652,20 @@ class SessionIndex:
                         # Claude Code native format
                         if not meta.get('slug'):
                             meta['slug'] = obj.get('slug', '')
+                        if source == 'claude':
+                            if t == 'custom-title':
+                                title = obj.get('customTitle')
+                                if isinstance(title, str) and title.strip():
+                                    meta['slug'] = title.strip().replace('\n', ' ')[:80]
+                                    meta['_custom_title'] = True
+                            elif t == 'ai-title' and not meta.get('_custom_title'):
+                                title = obj.get('aiTitle')
+                                if isinstance(title, str) and title.strip():
+                                    meta['slug'] = title.strip().replace('\n', ' ')[:80]
+                            elif t == 'agent-name' and not meta.get('slug'):
+                                title = obj.get('agentName')
+                                if isinstance(title, str):
+                                    meta['slug'] = title.strip().replace('\n', ' ')[:80]
                         if not meta.get('cwd'):
                             meta['cwd'] = obj.get('cwd', '')
                         if not meta.get('gitBranch'):
@@ -576,7 +765,7 @@ class SessionIndex:
         if meta.get('_openclaw'):
             try:
                 count = 0
-                with open(path, 'r', errors='replace') as f:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
                     for line in f:
                         if 'sessions_spawn' in line and '"accepted"' in line:
                             count += 1
@@ -622,7 +811,7 @@ class SessionIndex:
 
         # Read first few lines for metadata
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for _ in range(5):
                     line = f.readline()
                     if not line:
@@ -709,7 +898,7 @@ class SessionIndex:
     def _extract_codex_metadata(path, size):
         meta = {'event_count': max(1, size // 500)}
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 # Read first ~30 lines for session_meta, turn_context, first user msg
                 for _ in range(30):
                     line = f.readline()
@@ -893,7 +1082,7 @@ class SessionIndex:
 
         try:
             # Head scan wire.jsonl for TurnBegin (model)
-            with open(wire_path, 'r', errors='replace') as f:
+            with open(wire_path, 'r', encoding='utf-8', errors='replace') as f:
                 for _ in range(30):
                     line = f.readline()
                     if not line:
@@ -959,7 +1148,7 @@ class SessionIndex:
 
             # Head scan context.jsonl for cwd, first user prompt (slug)
             if context_path.exists():
-                with open(context_path, 'r', errors='replace') as f:
+                with open(context_path, 'r', encoding='utf-8', errors='replace') as f:
                     for _ in range(10):
                         line = f.readline()
                         if not line:
@@ -1103,7 +1292,7 @@ class SessionIndex:
         settings_path = path.with_suffix('.settings.json')
         if settings_path.exists():
             try:
-                with open(settings_path, 'r', errors='replace') as sf:
+                with open(settings_path, 'r', encoding='utf-8', errors='replace') as sf:
                     settings = json.loads(sf.read())
                     m = settings.get('model', '')
                     if m:
@@ -1112,7 +1301,7 @@ class SessionIndex:
                 pass
 
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for _ in range(15):
                     line = f.readline()
                     if not line:
@@ -1216,6 +1405,502 @@ class SessionIndex:
 
         return meta
 
+    # ── Hermes benchmark run scanning ──────────────────────────────────────
+
+    @staticmethod
+    def _read_json_file(path):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
+    def _scan_hermes_bench_runs(self, base_dir, sessions, projects):
+        """Scan a results directory for Hermes eval runs.
+
+        A run is any subdirectory containing a run_manifest.json /
+        recovery_manifest.json or predictions/retry JSONL output.
+        """
+        if not base_dir.exists():
+            return
+        project_name = base_dir.parent.name
+        display = 'hermes/' + project_name
+        projects.add(display)
+
+        for run_dir in base_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+
+            manifest = self._read_json_file(run_dir / 'run_manifest.json')
+            recovery = None
+            if manifest is None:
+                recovery = self._read_json_file(run_dir / 'recovery_manifest.json')
+                if recovery is None:
+                    continue
+
+            try:
+                st = run_dir.stat()
+                mtime = st.st_mtime
+            except OSError:
+                continue
+
+            watcher = self._read_json_file(run_dir / '.watcher_state.json') or {}
+            progress = self._read_json_file(run_dir / 'progress.json') or {}
+
+            # Model: prefer explicit model path from manifests
+            raw_model = ''
+            if isinstance(manifest, dict):
+                raw_model = manifest.get('model', '')
+            elif isinstance(recovery, dict):
+                raw_model = recovery.get('model', '')
+            model = Path(raw_model.replace('\\', '/')).name if raw_model else ''
+
+            # Progress: take the freshest of watcher_state / progress.json
+            candidates_done = [
+                v for v in (
+                    watcher.get('done', watcher.get('completed')),
+                    progress.get('processed_count', progress.get('completed')),
+                ) if isinstance(v, (int, float))
+            ]
+            done = int(max(candidates_done)) if candidates_done else 0
+            total = watcher.get('total',
+                    progress.get('total_count', progress.get('total')))
+            status = watcher.get('status') or progress.get('status') or ''
+            accuracy = watcher.get('accuracy', watcher.get('merged_accuracy'))
+
+            # Report score (full eval runs)
+            report = None
+            reports_dir = run_dir / 'reports'
+            if reports_dir.is_dir():
+                for rep_file in sorted(reports_dir.rglob('*.json')):
+                    report = self._read_json_file(rep_file)
+                    if report and report.get('score') is not None:
+                        break
+            if report and accuracy is None:
+                accuracy = report.get('score')
+
+            report_num = (report or {}).get('num')
+            if isinstance(report_num, (int, float)):
+                if not total:
+                    total = int(report_num)
+                # A published report means all samples were processed
+                if done < report_num:
+                    done = int(report_num)
+            if isinstance(total, (int, float)) and done >= total > 0:
+                status = 'completed'
+
+            pretty = (report or {}).get('dataset_pretty_name', '')
+            bench_name = (manifest or {}).get('benchmark', '') if isinstance(manifest, dict) else ''
+
+            # Slug: benchmark + score when available
+            done_total = f"{done}/{total if total is not None else '?'}"
+            kind = (recovery or {}).get('kind', '') if isinstance(recovery, dict) else ''
+            if kind == 'conditional_truncation_recovery':
+                slug = f"truncation-recovery {done_total}"
+                if accuracy is not None:
+                    slug += f" · {accuracy:.1%} merged"
+            elif accuracy is not None:
+                slug = f"{pretty or bench_name}: {accuracy:.1%} ({done_total})"
+            elif status == 'running':
+                slug = f"{pretty or bench_name}: running {done_total}"
+            else:
+                slug = pretty or bench_name or project_name
+
+            active = status == 'running' or (time.time() - mtime) < 120
+
+            # Size + event count from prediction/retry JSONL files
+            size = 0
+            pred_files = []
+            preds_dir = run_dir / 'predictions'
+            retry_file = run_dir / 'retry_results.jsonl'
+            if preds_dir.is_dir():
+                pred_files = [p for p in sorted(preds_dir.rglob('*.jsonl'))]
+            if not pred_files and retry_file.exists():
+                pred_files = [retry_file]
+            event_count = 0
+            size_files = list(pred_files)
+            if reports_dir.is_dir():
+                size_files.extend(p for p in reports_dir.rglob('*') if p.is_file())
+            latest_artifact = mtime
+            for pf in size_files:
+                try:
+                    st_pf = pf.stat()
+                    size += st_pf.st_size
+                    if st_pf.st_mtime > latest_artifact:
+                        latest_artifact = st_pf.st_mtime
+                except OSError:
+                    continue
+            if pred_files:
+                try:
+                    with open(pred_files[0], 'rb') as f:
+                        event_count = sum(1 for _ in f)
+                except OSError:
+                    event_count = max(1, size // 800)
+
+            # Duration approximated from manifest mtime (written at run start)
+            first_ts = None
+            for probe in ('run_manifest.json', 'recovery_manifest.json'):
+                p = run_dir / probe
+                if p.exists():
+                    try:
+                        first_ts = p.stat().st_mtime
+                    except OSError:
+                        pass
+                    break
+            duration = int(latest_artifact - first_ts) if first_ts else 0
+
+            sid = f'bench-{project_name}-{run_dir.name}'
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'hermes-bench',
+                'slug': slug,
+                'status': 'active' if active else 'completed',
+                'model': model,
+                'version': (manifest or {}).get('evalscope_version', '') if isinstance(manifest, dict) else '',
+                'mtime': mtime,
+                'size': size,
+                'eventCount': event_count,
+                'cwd': (manifest or {}).get('api_url', '') if isinstance(manifest, dict) else '',
+                'gitBranch': '',
+                'subagentCount': 0,
+                'duration': duration,
+                'contextPct': 0,
+                '_path': str(run_dir),
+            }
+
+    # ── Hermes agent session scanning (~/.hermes/sessions) ────────────────
+
+    _hermes_meta_cache = {}  # {path: (mtime, size, meta_dict)}
+
+    @classmethod
+    def _extract_hermes_metadata(cls, path, st):
+        """Cheap head/tail regex extraction for a Hermes session JSON.
+
+        Results are cached per (mtime, size) so the 30s rebuild only pays
+        full parsing for new or changed files.
+        """
+        cached = cls._hermes_meta_cache.get(str(path))
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return cached[2]
+
+        meta = {}
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                head = f.read(64 * 1024)
+                for key in ('model', 'platform', 'session_start'):
+                    m = re.search(rf'"{key}":\s*"([^"]*)"', head)
+                    if m:
+                        meta[key] = m.group(1)
+
+                # Slug: last short "content" string in the file tail
+                f.seek(max(0, st.st_size - 16 * 1024))
+                tail = f.read(st.st_size)
+            best = ''
+            for m in re.finditer(r'"content":\s*"((?:[^"\\]|\\.)*)"', tail):
+                text = m.group(1)
+                if len(text) > 200:
+                    continue
+                try:
+                    text = json.loads(f'"{text}"')
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                if 3 <= len(text) <= 120 and not text.startswith('<'):
+                    best = text
+            if not best:
+                m = re.search(r'"content":\s*"((?:[^"\\]|\\.)*)"', tail)
+                if m:
+                    best = m.group(1)[:80]
+            meta['slug'] = best.replace('\n', ' ').strip()
+        except OSError:
+            return None
+
+        cls._hermes_meta_cache[str(path)] = (st.st_mtime, st.st_size, meta)
+        if len(cls._hermes_meta_cache) > 5000:
+            # Keep the newest half when the cache grows unbounded
+            keys = list(cls._hermes_meta_cache.keys())
+            for k in keys[:len(keys) // 2]:
+                del cls._hermes_meta_cache[k]
+        return meta
+
+    def _scan_hermes_sessions(self, base_dir, sessions, projects):
+        """Scan a ~/.hermes/sessions directory for conversation JSON files."""
+        if not base_dir.exists():
+            return
+
+        for f in base_dir.glob('session_*.json'):
+            if f.name == 'sessions.json':
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_size == 0:
+                continue
+
+            meta = self._extract_hermes_metadata(f, st)
+            if meta is None:
+                continue
+
+            sid = 'hermes-' + f.stem
+            platform = meta.get('platform', '')
+            display = 'hermes/' + platform if platform else 'hermes'
+            projects.add(display)
+
+            age = time.time() - st.st_mtime
+            first_ts = None
+            start = meta.get('session_start')
+            if start:
+                try:
+                    first_ts = datetime.fromisoformat(start).timestamp()
+                except (ValueError, TypeError):
+                    pass
+
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'hermes',
+                'slug': meta.get('slug', '')[:80],
+                'status': 'active' if age < 300 else 'completed',
+                'model': meta.get('model', ''),
+                'version': '',
+                'mtime': st.st_mtime,
+                'size': st.st_size,
+                'eventCount': max(1, st.st_size // 800),
+                'cwd': '',
+                'gitBranch': '',
+                'subagentCount': 0,
+                'duration': int(st.st_mtime - first_ts) if first_ts else 0,
+                'contextPct': 0,
+                '_path': str(f),
+            }
+
+    def _scan_hermes_state_sessions(self, sessions, projects):
+        """Scan the live Hermes SessionDB (via WSL bridge)."""
+        rows = _wsl_hermes_bridge(['list', 500], timeout=30)
+        if not isinstance(rows, list):
+            return
+        now = time.time()
+        for r in rows:
+            sid_raw = str(r.get('id') or '')
+            if not re.match(r'^[A-Za-z0-9_.-]+$', sid_raw):
+                continue
+            sid = 'hs-' + sid_raw
+
+            source = r.get('source') or ''
+            display = 'hermes/' + source if source else 'hermes'
+            projects.add(display)
+
+            started = r.get('started_at') or 0
+            ended = r.get('ended_at')
+            active = ended is None or (now - ended) < 120
+
+            tokens_in = r.get('input_tokens') or 0
+            cache_read = r.get('cache_read_tokens') or 0
+            model = r.get('model') or ''
+            ctx_size = self._get_context_size(model)
+            context_pct = (round((tokens_in + cache_read) / ctx_size * 100)
+                           if ctx_size and tokens_in else 0)
+
+            slug = ((r.get('title') or '').strip()
+                    or (r.get('last_activity') or '').strip()
+                    or model)
+            try:
+                mtime = float(ended or started or 0)
+            except (TypeError, ValueError):
+                mtime = 0
+
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'hermes',
+                'slug': slug.replace('\n', ' ')[:80],
+                'status': 'active' if active else 'completed',
+                'model': model,
+                'version': '',
+                'mtime': mtime,
+                'size': 0,
+                'eventCount': r.get('message_count') or 0,
+                'cwd': r.get('cwd') or '',
+                'gitBranch': r.get('git_branch') or '',
+                'subagentCount': 0,
+                'duration': int((ended or now) - started) if started else 0,
+                'contextPct': context_pct,
+                '_path': f'hermes-state://{sid_raw}',
+            }
+
+    # ── OpenCode session scanning (SQLite) ────────────────────────────────
+
+    @staticmethod
+    def _open_opencode_db_ro():
+        uri = OPENCODE_DB.as_posix()
+        if os.name == 'nt':
+            uri = '/' + uri
+        return sqlite3.connect(f'file:{uri}?mode=ro', uri=True)
+
+    @staticmethod
+    def _opencode_display(directory, projects):
+        """Build the project display name for an OpenCode session."""
+        home_prefix = str(Path.home()).replace('\\', '/') + '/'
+        dir_norm = str(directory or '').replace('\\', '/')
+        rel = dir_norm.replace(home_prefix, '').rstrip('/') if dir_norm else ''
+        display = 'opencode/' + rel if rel else 'opencode'
+        projects.add(display)
+        return display
+
+    def _scan_opencode_sessions(self, sessions, projects):
+        """Scan the OpenCode SQLite store for sessions."""
+        try:
+            con = self._open_opencode_db_ro()
+        except Exception:
+            return
+        try:
+            rows = con.execute(
+                'SELECT id, directory, title, version, agent, model,'
+                ' tokens_input, tokens_output, tokens_cache_read, cost,'
+                ' time_created, time_updated FROM session'
+                ' ORDER BY time_updated DESC LIMIT 2000'
+            ).fetchall()
+            # One grouped query for message counts (avoids per-session queries)
+            msg_counts = {}
+            for ses_id_, cnt in con.execute(
+                'SELECT session_id, COUNT(*) FROM message GROUP BY session_id'
+            ):
+                msg_counts[ses_id_] = cnt
+        except Exception:
+            return
+        finally:
+            con.close()
+
+        now = time.time()
+        for (sid_raw, directory, title, version, agent, model_raw,
+             tokens_in, tokens_out, cache_read, cost,
+             t_created, t_updated) in rows:
+
+            ses_id = sid_raw
+            sid = 'opencode-' + ses_id
+
+            # Model stored as JSON {"id": ..., "providerID": ..., "variant": ...}
+            model_id = ''
+            try:
+                mobj = json.loads(model_raw) if model_raw else {}
+                if isinstance(mobj, dict):
+                    model_id = mobj.get('id', '')
+            except (json.JSONDecodeError, ValueError):
+                model_id = model_raw or ''
+
+            msg_count = msg_counts.get(ses_id) or max(1, int((tokens_out or 0) / 300))
+
+            record = self._build_opencode_record(
+                ses_id=sid_raw,
+                directory=directory,
+                title=title,
+                version=version,
+                model=model_id,
+                tokens_in=tokens_in,
+                cache_read=cache_read,
+                msg_count=msg_count,
+                t_created=t_created,
+                t_updated=t_updated,
+                now=now,
+                path=f'{OPENCODE_DB}::{ses_id}',
+            )
+            record['project'] = self._opencode_display(directory, projects)
+            sessions[sid] = record
+
+    def _scan_opencode_legacy_sessions(self, sess_dir, sessions, projects):
+        """Scan the pre-SQLite OpenCode JSON store (storage/session/...)."""
+        now = time.time()
+        for proj_dir in sess_dir.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob('ses_*.json'):
+                try:
+                    d = json.loads(f.read_text(encoding='utf-8', errors='replace'))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    continue
+                ses_id = d.get('id') or f.stem
+                if not ses_id:
+                    continue
+                sid = 'opencode-' + ses_id
+                if sid in sessions:
+                    continue  # DB store wins on collision
+
+                t_created = (d.get('time') or {}).get('created') or 0
+                t_updated = (d.get('time') or {}).get('updated') or 0
+
+                # Single pass over messages: count, token sums, latest model
+                msg_dir = OPENCODE_STORAGE_DIR / 'message' / ses_id
+                msg_count = 0
+                tokens_in = tokens_out = cache_read = 0
+                last_ts_model = ''
+                latest_assistant_ts = -1
+                if msg_dir.is_dir():
+                    for mf in msg_dir.glob('msg_*.json'):
+                        msg_count += 1
+                        try:
+                            md = json.loads(mf.read_text(encoding='utf-8', errors='replace'))
+                        except (OSError, json.JSONDecodeError, ValueError):
+                            continue
+                        if md.get('role') != 'assistant':
+                            continue
+                        tk = md.get('tokens') or {}
+                        tokens_in += tk.get('input', 0) or 0
+                        tokens_out += tk.get('output', 0) or 0
+                        cache_read += (tk.get('cache') or {}).get('read', 0) or 0
+                        ts_ = ((md.get('time') or {}).get('created')) or 0
+                        if ts_ >= latest_assistant_ts and md.get('modelID'):
+                            latest_assistant_ts = ts_
+                            last_ts_model = md['modelID']
+
+                record = self._build_opencode_record(
+                    ses_id=ses_id,
+                    directory=d.get('directory'),
+                    title=d.get('title'),
+                    version=d.get('version'),
+                    model=last_ts_model,
+                    tokens_in=tokens_in,
+                    cache_read=cache_read,
+                    msg_count=max(msg_count, 1),
+                    t_created=t_created,
+                    t_updated=t_updated,
+                    now=now,
+                    path=f'{OPENCODE_STORAGE_DIR}::{ses_id}',
+                )
+                record['project'] = self._opencode_display(
+                    d.get('directory'), projects)
+                sessions[sid] = record
+
+    def _build_opencode_record(self, ses_id, directory, title, version, model,
+                               tokens_in, cache_read, msg_count,
+                               t_created, t_updated, now, path):
+        """Assemble the unified session record shared by both OpenCode stores."""
+        updated = (t_updated or t_created or 0) / 1000
+        created = (t_created or 0) / 1000
+        active = (now - updated) < 120
+
+        last_input = (tokens_in or 0) + (cache_read or 0)
+        ctx_size = self._get_context_size(model)
+        context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
+
+        return {
+            'sessionId': 'opencode-' + ses_id,
+            'source': 'opencode',
+            'slug': str(title or '').replace('\n', ' ')[:80],
+            'status': 'active' if active else 'completed',
+            'model': model,
+            'version': str(version or ''),
+            'mtime': updated,
+            'size': 0,
+            'eventCount': msg_count,
+            'cwd': str(directory or ''),
+            'gitBranch': '',
+            'subagentCount': 0,
+            'duration': int(updated - created) if created else 0,
+            'contextPct': context_pct,
+            '_path': path,
+        }
+
     # ── content search via ripgrep ────────────────────────────────────────
 
     _content_cache = {}  # class-level: {cache_key: {'ids': set, 'time': float}}
@@ -1281,28 +1966,59 @@ class SessionIndex:
             for d in WSL_DROID_DIRS:
                 if d.exists():
                     dirs.append(str(d))
+        if source in (None, 'hermes-bench'):
+            for d in HERMES_BENCH_DIRS:
+                if d.exists():
+                    dirs.append(str(d))
 
-        if not dirs:
+        # OpenCode lives in SQLite — search via LIKE instead of ripgrep
+        oc_ids = set()
+        if (source in (None, 'opencode')) and OPENCODE_DB.exists():
+            try:
+                con = self._open_opencode_db_ro()
+                like = f'%{query}%'
+                for table in ('part', 'message'):
+                    for r in con.execute(
+                        f'SELECT DISTINCT session_id FROM {table}'
+                        ' WHERE data LIKE ? LIMIT 500',
+                        (like,),
+                    ):
+                        oc_ids.add('opencode-' + r[0])
+                con.close()
+            except Exception:
+                pass
+
+        if not dirs and not oc_ids:
             return set()
 
-        cmd = [
-            'rg', '-l', '--fixed-strings', '--max-filesize', '50M',
-            '--glob', '*.jsonl',
-            '--glob', '!*openclaw-workspace*', '--glob', '!*observer*',
-            query,
-        ] + dirs
+        paths = []
+        rg_bin = _find_rg()
+        if dirs and rg_bin:
+            cmd = [
+                rg_bin, '-l', '--fixed-strings', '--max-filesize', '50M',
+                '--glob', '*.jsonl',
+                '--glob', '!*openclaw-workspace*', '--glob', '!*observer*',
+                query,
+            ] + dirs
 
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10,
-            )
-            paths = result.stdout.strip().split('\n') if result.stdout.strip() else []
-        except (subprocess.TimeoutExpired, OSError):
-            return set()
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10,
+                    stdin=subprocess.DEVNULL,
+                )
+                paths = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            except (subprocess.TimeoutExpired, OSError):
+                paths = []
 
-        # Map file paths back to session IDs via reverse lookup
+        # Map file paths back to session IDs via reverse lookup.
+        # Bench runs are directories (_path = run dir), so files found
+        # inside them map to the parent run by prefix.
         with self._lock:
-            path_to_id = {s['_path']: sid for sid, s in self._sessions.items()}
+            path_to_id = {s['_path']: sid for sid, s in self._sessions.items()
+                          if s.get('source') != 'hermes-bench'}
+            bench_dirs = [(os.path.normcase(os.path.normpath(s['_path'])), sid)
+                          for sid, s in self._sessions.items()
+                          if s.get('source') == 'hermes-bench']
 
         matched_ids = set()
         for p in paths:
@@ -1310,8 +2026,15 @@ class SessionIndex:
             if not p:
                 continue
             sid = path_to_id.get(p)
+            if not sid:
+                pn = os.path.normcase(os.path.normpath(p))
+                for bn, b_sid in bench_dirs:
+                    if pn.startswith(bn + os.sep):
+                        sid = b_sid
+                        break
             if sid:
                 matched_ids.add(sid)
+        matched_ids |= oc_ids
 
         self._content_cache[cache_key] = {'ids': matched_ids, 'time': time.time()}
         return matched_ids
@@ -1330,7 +2053,8 @@ class SessionIndex:
         # Collect available sources
         sources = sorted(set(s.get('source', 'claude') for s in sessions))
 
-        if source and source in ('claude', 'openclaw', 'codex', 'kimi', 'droid'):
+        if source and source in ('claude', 'openclaw', 'codex', 'kimi', 'droid',
+                                 'hermes-bench', 'opencode', 'hermes'):
             sessions = [s for s in sessions if s.get('source') == source]
         if project:
             sessions = [s for s in sessions if s['project'] == project]
@@ -1426,7 +2150,18 @@ class SessionEventReader:
     _SKIP_TYPES = frozenset([
         'file-history-snapshot', 'queue-operation',
         'session', 'thinking_level_change', 'custom',
+        # Claude Code metadata/noise lines: no uuid, nothing to render.
+        # Skipping keeps the event limit for real messages and stops the
+        # poll cursor from being overwritten with an empty uuid.
+        'attachment', 'last-prompt', 'atis-latch', 'mode', 'permission-mode',
+        'ai-title', 'custom-title', 'agent-name', 'pr-link',
+        'bridge-session', 'file-history-delta', 'cost-state',
     ])
+
+    # path -> (size, mtime, {byte_offset: line_count}). Line-number cursors
+    # for Codex/Kimi tail reads need the newline count before the tail
+    # offset; counting the whole file on every poll is O(size).
+    _line_offset_cache = {}
 
     _CODEX_TYPES = frozenset([
         'session_meta', 'response_item', 'event_msg', 'turn_context',
@@ -1443,6 +2178,279 @@ class SessionEventReader:
         """Check if path is under any Kimi sessions directory (Windows or WSL)."""
         s = str(path)
         return any(s.startswith(str(d)) for d in [KIMI_DIR] + WSL_KIMI_DIRS)
+
+    @staticmethod
+    def _is_opencode_path(path):
+        """Check if path is an OpenCode SQLite pseudo-path (<db>::<sessionId>)."""
+        return str(path).startswith(str(OPENCODE_DB) + '::')
+
+    @staticmethod
+    def _is_legacy_opencode_path(path):
+        """Check if path is a legacy OpenCode pseudo-path (<storage>::<sessionId>)."""
+        return str(path).startswith(str(OPENCODE_STORAGE_DIR) + '::')
+
+    @staticmethod
+    def _is_hermes_session_path(path):
+        """Check if path is a Hermes agent session JSON file."""
+        s = str(path)
+        return s.endswith('.json') and any(
+            s.startswith(str(d)) for d in HERMES_SESSION_DIRS
+        )
+
+    @staticmethod
+    def _is_hermes_state_path(path):
+        """Check if path is a live Hermes SessionDB pseudo-path."""
+        return str(path).startswith('hermes-state://')
+
+    @staticmethod
+    def _hermes_content_text(content):
+        """Flatten an OpenAI-style content field into display text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for b in content:
+                if isinstance(b, dict) and b.get('type') == 'text' and b.get('text'):
+                    texts.append(b['text'])
+            return '\n'.join(texts)
+        if content is None:
+            return ''
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(content)
+
+    @classmethod
+    def _convert_openai_messages(cls, prefix, pairs, fallback_model=''):
+        """Convert OpenAI-style messages into unified events.
+
+        pairs: iterable of (key, message_dict) — key becomes the numeric
+        cursor id embedded in each event uuid.
+        """
+        converted = []  # (key, event)
+        for key, m in pairs:
+            role = m.get('role', '')
+            if role == 'system':
+                continue
+            uuid = f'{prefix}-{key}'
+            ts = m.get('_ts_iso') or ''
+            if not ts and isinstance(m.get('timestamp'), (int, float)):
+                ts = cls._ms_to_iso(m['timestamp'] * 1000)
+
+            if role == 'user':
+                text = cls._hermes_content_text(m.get('content'))
+                if not text.strip():
+                    continue
+                ev = {
+                    'type': 'user',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'userType': 'external',
+                    'text': text[:MAX_TEXT_LEN],
+                    'truncated': len(text) > MAX_TEXT_LEN,
+                }
+                converted.append((key, ev))
+
+            elif role == 'assistant':
+                text = cls._hermes_content_text(m.get('content'))
+                ev = {
+                    'type': 'assistant',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'model': m.get('model', '') or fallback_model,
+                    'usage': {},
+                    'stop_reason': '',
+                }
+                tool_uses = []
+                for tc in m.get('tool_calls') or []:
+                    fn = tc.get('function') or {}
+                    args = fn.get('arguments', '{}')
+                    if not isinstance(args, str):
+                        try:
+                            args = json.dumps(args, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            args = str(args)
+                    truncated = len(args) > MAX_TOOL_INPUT_LEN
+                    tool_uses.append({
+                        'type': 'tool_use',
+                        'id': tc.get('id', ''),
+                        'name': fn.get('name', ''),
+                        'input': args[:MAX_TOOL_INPUT_LEN],
+                        'truncated': truncated,
+                    })
+                if tool_uses:
+                    ev['tool_uses'] = tool_uses
+                if text.strip():
+                    ev['text'] = text[:MAX_TEXT_LEN]
+                    ev['truncated'] = len(text) > MAX_TEXT_LEN
+                if text.strip() or tool_uses:
+                    converted.append((key, ev))
+
+            elif role == 'tool':
+                output = cls._hermes_content_text(m.get('content'))
+                ev = {
+                    'type': 'user',
+                    'uuid': uuid,
+                    'timestamp': ts,
+                    'userType': 'tool_result',
+                    'tool_results': [{
+                        'tool_use_id': m.get('tool_call_id', ''),
+                        'type': 'tool_result',
+                        'content': output[:MAX_TOOL_RESULT_LEN],
+                        'truncated': len(output) > MAX_TOOL_RESULT_LEN,
+                    }],
+                }
+                converted.append((key, ev))
+
+        return converted
+
+    @staticmethod
+    def _select_converted(converted, prefix, after, limit, types):
+        """Cursor/limit/types selection over converted (key, event) pairs."""
+        if after:
+            m = re.match(rf'{prefix}-(\d+)$', str(after))
+            idx = int(m.group(1)) if m else -1
+            selected = [(k, ev) for k, ev in converted if k > idx][:limit]
+        else:
+            selected = converted[-limit:]
+        return [
+            ev for _, ev in selected
+            if not types or ev['type'] in types
+        ]
+
+    @classmethod
+    def _read_hermes_events(cls, path, after=None, limit=100, types=None):
+        """Read a Hermes session JSON (OpenAI-style messages) into unified events."""
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return []
+
+        pairs = list(enumerate(data.get('messages') or []))
+        converted = cls._convert_openai_messages(
+            'hmsg', pairs, data.get('model', ''))
+        return cls._select_converted(
+            converted, 'hmsg', after, limit, types)
+
+    @classmethod
+    def _read_hermes_state_events(cls, path, after=None, limit=100, types=None):
+        """Read a live Hermes SessionDB session via the WSL bridge."""
+        sid = str(path).split('://', 1)[1]
+        msgs = _wsl_hermes_bridge(['msgs', sid], timeout=30)
+        if not isinstance(msgs, list):
+            return []
+        pairs = []
+        for m in msgs:
+            try:
+                key = int(m.get('id'))
+            except (TypeError, ValueError):
+                continue
+            pairs.append((key, m))
+        converted = cls._convert_openai_messages('hstate', pairs)
+        return cls._select_converted(
+            converted, 'hstate', after, limit, types)
+
+    @classmethod
+    def _get_hermes_stats(cls, path):
+        stats = {
+            'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
+            'tokens': {
+                'input': 0, 'output': 0,
+                'cache_read': 0, 'cache_creation': 0,
+            },
+            'tool_calls': {},
+            'event_counts': {},
+            'first_timestamp': '',
+            'last_timestamp': '',
+            'duration_seconds': 0,
+        }
+        try:
+            st = os.stat(path)
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return stats
+
+        stats['model'] = data.get('model', '')
+        start = data.get('session_start', '')
+        if start:
+            stats['first_timestamp'] = start
+            try:
+                start_ts = datetime.fromisoformat(start).timestamp()
+                stats['last_timestamp'] = datetime.fromtimestamp(
+                    st.st_mtime).isoformat()
+                stats['duration_seconds'] = int(st.st_mtime - start_ts)
+            except (ValueError, TypeError, OSError):
+                pass
+
+        for m in data.get('messages') or []:
+            role = m.get('role', '?')
+            if role == 'system':
+                continue
+            stats['event_counts'][role] = stats['event_counts'].get(role, 0) + 1
+            for tc in m.get('tool_calls') or []:
+                name = ((tc.get('function') or {}).get('name')) or 'unknown'
+                stats['tool_calls'][name] = stats['tool_calls'].get(name, 0) + 1
+        return stats
+
+    @classmethod
+    def _get_hermes_state_stats(cls, path):
+        sid = str(path).split('://', 1)[1]
+        stats = {
+            'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
+            'tokens': {
+                'input': 0, 'output': 0,
+                'cache_read': 0, 'cache_creation': 0,
+            },
+            'tool_calls': {},
+            'event_counts': {},
+            'first_timestamp': '',
+            'last_timestamp': '',
+            'duration_seconds': 0,
+        }
+        d = _wsl_hermes_bridge(['stats', sid], timeout=15)
+        if not isinstance(d, dict) or d.get('error'):
+            return stats
+        started = d.get('started_at')
+        ended = d.get('ended_at')
+        stats.update({
+            'model': d.get('model') or '',
+            'cwd': d.get('cwd') or '',
+            'gitBranch': d.get('git_branch') or '',
+            'tokens': {
+                'input': d.get('input_tokens') or 0,
+                'output': d.get('output_tokens') or 0,
+                'cache_read': d.get('cache_read_tokens') or 0,
+                'cache_creation': d.get('cache_write_tokens') or 0,
+            },
+            'tool_calls': d.get('tool_calls') or {},
+            'event_counts': d.get('roles') or {},
+            'first_timestamp': cls._ms_to_iso(
+                (started or 0) * 1000) if started else '',
+            'last_timestamp': cls._ms_to_iso(
+                (ended or 0) * 1000) if ended else '',
+            'duration_seconds': int(ended - started) if ended and started else 0,
+        })
+        return stats
+
+    @staticmethod
+    def _is_hermes_bench_path(path):
+        """Check if path is a Hermes benchmark run directory."""
+        s = str(path)
+        return os.path.isdir(s) and any(
+            s.startswith(str(d)) for d in HERMES_BENCH_DIRS
+        )
+
+    @staticmethod
+    def _ms_to_iso(ms):
+        """Convert millisecond epoch to ISO timestamp string."""
+        if not ms:
+            return ''
+        try:
+            return datetime.fromtimestamp(ms / 1000).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return ''
 
     @staticmethod
     def extract_compaction_summary(events):
@@ -1475,18 +2483,28 @@ class SessionEventReader:
     def read_events(cls, path, after=None, limit=100, types=None, full=False):
         events = []
         try:
-            file_size = os.path.getsize(path)
-
-            if cls._is_codex_path(path):
-                events = cls._read_codex_events(path, file_size, after, limit, types)
-            elif cls._is_kimi_path(path):
-                events = cls._read_kimi_events(path, file_size, after, limit, types)
-            elif after:
-                events = cls._read_after_cursor(path, file_size, after, limit, types)
-            elif full:
-                events = cls._read_full(path, limit, types)
+            if cls._is_opencode_path(path):
+                events = cls._read_opencode_events(path, after, limit, types)
+            elif cls._is_legacy_opencode_path(path):
+                events = cls._read_opencode_legacy_events(path, after, limit, types)
+            elif cls._is_hermes_state_path(path):
+                events = cls._read_hermes_state_events(path, after, limit, types)
+            elif cls._is_hermes_session_path(path):
+                events = cls._read_hermes_events(path, after, limit, types)
+            elif cls._is_hermes_bench_path(path):
+                events = cls._read_hermes_bench_events(path, after, limit, types)
             else:
-                events = cls._read_tail(path, file_size, limit, types)
+                file_size = os.path.getsize(path)
+                if cls._is_codex_path(path):
+                    events = cls._read_codex_events(path, file_size, after, limit, types)
+                elif cls._is_kimi_path(path):
+                    events = cls._read_kimi_events(path, file_size, after, limit, types)
+                elif after:
+                    events = cls._read_after_cursor(path, file_size, after, limit, types)
+                elif full:
+                    events = cls._read_full(path, limit, types)
+                else:
+                    events = cls._read_tail(path, file_size, limit, types)
         except OSError as e:
             print(f"Error reading session: {e}", file=sys.stderr)
 
@@ -1496,7 +2514,7 @@ class SessionEventReader:
     def _read_full(cls, path, limit, types):
         """Read all events from beginning of file (for export/copy)."""
         events = []
-        with open(path, 'r', errors='replace') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 ev = cls._parse_event(line.strip())
                 if ev and ev['type'] not in cls._SKIP_TYPES:
@@ -1514,7 +2532,7 @@ class SessionEventReader:
 
         # Try tail section first (cursor is usually near the end)
         if file_size > TAIL_READ_BYTES:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 f.seek(max(0, file_size - TAIL_READ_BYTES))
                 f.readline()
                 for line in f:
@@ -1538,7 +2556,7 @@ class SessionEventReader:
 
         if not found:
             # Full scan
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -1566,7 +2584,7 @@ class SessionEventReader:
         events = []
 
         if file_size > TAIL_READ_BYTES:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 f.seek(max(0, file_size - TAIL_READ_BYTES))
                 f.readline()
                 for line in f:
@@ -1576,7 +2594,7 @@ class SessionEventReader:
                             events.append(ev)
             return events[-limit:]
 
-        with open(path, 'r', errors='replace') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 ev = cls._parse_event(line.strip())
                 if ev and ev['type'] not in cls._SKIP_TYPES:
@@ -1585,6 +2603,40 @@ class SessionEventReader:
         return events[-limit:]
 
     # ── Codex event reading ────────────────────────────────────────────────
+
+    @classmethod
+    def _count_lines_before(cls, path, offset, file_size):
+        """Count newlines in [0, offset) with a per-file mtime-keyed cache."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
+        key = str(path)
+        entry = cls._line_offset_cache.get(key)
+        valid = entry and entry[0] == file_size and st and entry[1] == st.st_mtime
+        if valid and offset in entry[2]:
+            return entry[2][offset]
+
+        count = 0
+        with open(path, 'rb') as f:
+            remaining = offset
+            while remaining > 0:
+                chunk = f.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                count += chunk.count(b'\n')
+                remaining -= len(chunk)
+
+        if len(cls._line_offset_cache) > 2000:
+            cls._line_offset_cache.clear()
+            entry = None
+        if valid:
+            entry[2][offset] = count
+        else:
+            cls._line_offset_cache[key] = (
+                file_size, st.st_mtime if st else 0, {offset: count},
+            )
+        return count
 
     @classmethod
     def _read_codex_events(cls, path, file_size, after=None, limit=100, types=None):
@@ -1600,7 +2652,7 @@ class SessionEventReader:
 
             # Cursor-based: scan from beginning to find the line
             found = False
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f):
                     if not found:
                         if line_num == after_line:
@@ -1620,16 +2672,11 @@ class SessionEventReader:
         # Initial load (no cursor): use tail-read for large files
         if file_size > TAIL_READ_BYTES:
             # Count total lines first to get correct line numbers
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 f.seek(max(0, file_size - TAIL_READ_BYTES))
                 f.readline()  # discard partial
                 start_offset = f.tell()
-                # Count lines before this offset
-                f.seek(0)
-                line_offset = 0
-                while f.tell() < start_offset:
-                    f.readline()
-                    line_offset += 1
+                line_offset = cls._count_lines_before(path, start_offset, file_size)
                 # Now read from offset with correct line numbers
                 f.seek(start_offset)
                 for rel_num, line in enumerate(f):
@@ -1643,7 +2690,7 @@ class SessionEventReader:
             return events[-limit:]
 
         # Small files: full scan
-        with open(path, 'r', errors='replace') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for line_num, line in enumerate(f):
                 line = line.strip()
                 if not line:
@@ -1869,7 +2916,7 @@ class SessionEventReader:
                 return events
 
             found = False
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f):
                     if not found:
                         if line_num == after_line:
@@ -1893,20 +2940,21 @@ class SessionEventReader:
                 f.seek(max(0, file_size - seek_back))
                 if file_size > seek_back:
                     f.readline()  # skip partial line
+                start_offset = f.tell()
                 tail = f.read().decode('utf-8', errors='replace')
-            est_start = max(0, round((file_size - TAIL_READ_BYTES) / 200))
+            line_offset = cls._count_lines_before(path, start_offset, file_size)
             for i, line in enumerate(tail.split('\n')):
                 line = line.strip()
                 if not line:
                     continue
-                ev = cls._parse_kimi_event(line, est_start + i)
+                ev = cls._parse_kimi_event(line, line_offset + i)
                 if ev and ev['type'] not in cls._SKIP_TYPES:
                     if not types or ev['type'] in types:
                         events.append(ev)
             return events[-limit:]
 
         # Full scan for small files
-        with open(path, 'r', errors='replace') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for line_num, line in enumerate(f):
                 line = line.strip()
                 if not line:
@@ -2194,6 +3242,455 @@ class SessionEventReader:
 
         return result
 
+    # ── OpenCode event reading (SQLite) ────────────────────────────────
+
+    @classmethod
+    def _read_opencode_events(cls, path, after=None, limit=100, types=None):
+        """Read OpenCode messages/parts from SQLite into unified events."""
+        ses_id = str(path).split('::', 1)[1]
+        events = []
+
+        try:
+            con = SessionIndex._open_opencode_db_ro()
+        except Exception:
+            return events
+
+        try:
+            rows = con.execute(
+                'SELECT id, time_created, data FROM message'
+                ' WHERE session_id = ? ORDER BY time_created',
+                (ses_id,),
+            ).fetchall()
+
+            skipping = bool(after)
+            for msg_id, t_created, data_raw in rows:
+                uuid = 'ocmsg-' + msg_id
+                if skipping:
+                    if after == uuid or after.startswith(uuid + '-tr'):
+                        skipping = False
+                    continue
+                try:
+                    mdata = json.loads(data_raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                role = mdata.get('role', '')
+                ts = cls._ms_to_iso(t_created)
+
+                parts = []
+                try:
+                    prows = con.execute(
+                        'SELECT data FROM part'
+                        ' WHERE session_id = ? AND message_id = ?'
+                        ' ORDER BY time_created',
+                        (ses_id, msg_id),
+                    ).fetchall()
+                    for r in prows:
+                        try:
+                            parts.append(json.loads(r[0]))
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                except sqlite3.Error:
+                    parts = []
+
+                evs = cls._parse_opencode_message(uuid, ts, role, mdata, parts)
+                # Emit the whole message atomically so a mid-message limit
+                # can never strand its tool results on the next poll.
+                batch = [
+                    ev for ev in evs
+                    if ev['type'] not in cls._SKIP_TYPES
+                    and (not types or ev['type'] in types)
+                ]
+                events.extend(batch)
+                if len(events) >= limit:
+                    break
+        except sqlite3.Error:
+            pass
+        finally:
+            con.close()
+
+        return events
+
+    @classmethod
+    def _read_opencode_legacy_events(cls, path, after=None, limit=100, types=None):
+        """Read messages/parts from the legacy OpenCode JSON store."""
+        ses_id = str(path).split('::', 1)[1]
+        events = []
+
+        msg_dir = OPENCODE_STORAGE_DIR / 'message' / ses_id
+        if not msg_dir.is_dir():
+            return events
+        part_root = OPENCODE_STORAGE_DIR / 'part'
+
+        msgs = []
+        for mf in msg_dir.glob('msg_*.json'):
+            try:
+                d = json.loads(mf.read_text(encoding='utf-8', errors='replace'))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            t = ((d.get('time') or {}).get('created')) or 0
+            msgs.append((t, mf.stem, d))
+        msgs.sort(key=lambda x: (x[0], x[1]))
+
+        skipping = bool(after)
+        for t_created, _name, mdata in msgs:
+            uuid = 'ocmsg-' + mdata.get('id', _name)
+            if skipping:
+                if after == uuid or after.startswith(uuid + '-tr'):
+                    skipping = False
+                continue
+            role = mdata.get('role', '')
+            ts = cls._ms_to_iso(t_created)
+
+            parts = []
+            p_dir = part_root / mdata.get('id', _name)
+            if p_dir.is_dir():
+                for pf in sorted(p_dir.glob('prt_*.json')):
+                    try:
+                        parts.append(json.loads(pf.read_text(encoding='utf-8', errors='replace')))
+                    except (OSError, json.JSONDecodeError, ValueError):
+                        continue
+
+            evs = cls._parse_opencode_message(uuid, ts, role, mdata, parts)
+            batch = [
+                ev for ev in evs
+                if ev['type'] not in cls._SKIP_TYPES
+                and (not types or ev['type'] in types)
+            ]
+            events.extend(batch)
+            if len(events) >= limit:
+                break
+
+        return events
+
+    @staticmethod
+    def _parse_opencode_message(uuid, ts, role, mdata, parts):
+        """Convert one OpenCode message (+parts) into unified event(s)."""
+        events = []
+        texts = []
+        tool_uses = []
+        tool_results = []
+
+        for i, p in enumerate(parts):
+            pt = p.get('type', '')
+            if pt == 'text':
+                texts.append(p.get('text', ''))
+            elif pt == 'tool':
+                state = p.get('state') or {}
+                call_id = p.get('callID', '')
+                inp = state.get('input') or {}
+                inp_str = inp if isinstance(inp, str) else json.dumps(inp, ensure_ascii=False)
+                truncated_in = len(inp_str) > MAX_TOOL_INPUT_LEN
+                tool_uses.append({
+                    'type': 'tool_use',
+                    'id': call_id,
+                    'name': p.get('tool', ''),
+                    'input': inp_str[:MAX_TOOL_INPUT_LEN],
+                    'truncated': truncated_in,
+                })
+                if state.get('status') == 'completed':
+                    out = state.get('output', '')
+                    out_str = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+                    tool_results.append({
+                        'tool_use_id': call_id,
+                        'type': 'tool_result',
+                        'content': out_str[:MAX_TOOL_RESULT_LEN],
+                        'truncated': len(out_str) > MAX_TOOL_RESULT_LEN,
+                    })
+
+        joined = '\n'.join(texts)
+
+        if role == 'user':
+            ev = {
+                'type': 'user',
+                'uuid': uuid,
+                'timestamp': ts,
+                'userType': 'external',
+            }
+            if joined:
+                ev['text'] = joined[:MAX_TEXT_LEN]
+                ev['truncated'] = len(joined) > MAX_TEXT_LEN
+            events.append(ev)
+        elif role == 'assistant':
+            tokens = mdata.get('tokens', {}) or {}
+            cache = tokens.get('cache', {}) or {}
+            usage = {
+                'input_tokens': tokens.get('input', 0),
+                'output_tokens': tokens.get('output', 0),
+                'cache_read_input_tokens': cache.get('read', 0),
+                'cache_creation_input_tokens': cache.get('write', 0),
+            }
+            ev = {
+                'type': 'assistant',
+                'uuid': uuid,
+                'timestamp': ts,
+                'model': mdata.get('modelID', ''),
+                'usage': usage,
+                'stop_reason': mdata.get('finish', ''),
+            }
+            if joined:
+                ev['text'] = joined[:MAX_TEXT_LEN]
+                ev['truncated'] = len(joined) > MAX_TEXT_LEN
+            if tool_uses:
+                ev['tool_uses'] = tool_uses
+            events.append(ev)
+
+        # Tool results as follow-up user events (codex-style)
+        for j, tr in enumerate(tool_results):
+            events.append({
+                'type': 'user',
+                'uuid': f'{uuid}-tr{j}',
+                'timestamp': ts,
+                'userType': 'tool_result',
+                'tool_results': [tr],
+            })
+
+        return events
+
+    # ── Hermes benchmark event reading ──────────────────────────────────
+
+    @staticmethod
+    def _bench_pred_files(run_dir):
+        preds_dir = run_dir / 'predictions'
+        files = list(preds_dir.rglob('*.jsonl')) if preds_dir.is_dir() else []
+        if not files:
+            retry = run_dir / 'retry_results.jsonl'
+            if retry.exists():
+                files = [retry]
+        return files
+
+    @classmethod
+    def _build_bench_line_events(cls, line_idx, raw):
+        """Build (user question, assistant answer) events from one prediction/retry line."""
+        ts = ''
+        uuid_q = f'bench-{line_idx}-q'
+        uuid_a = f'bench-{line_idx}-a'
+
+        if 'messages' in raw:
+            # Full prediction line (evalscope run)
+            prompt_msgs = raw.get('messages') or []
+            q_text = ''
+            for m in prompt_msgs:
+                if m.get('role') == 'user':
+                    c = m.get('content', '')
+                    q_text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+                    break
+            mo = raw.get('model_output') or {}
+            choices = mo.get('choices') or [{}]
+            msg = (choices[0] or {}).get('message') or {}
+            blocks = msg.get('content')
+            a_parts = []
+            if isinstance(blocks, list):
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get('type') == 'reasoning' and b.get('reasoning'):
+                        a_parts.append(str(b['reasoning']))
+                    elif b.get('type') == 'text' and b.get('text'):
+                        a_parts.append(str(b['text']))
+            elif isinstance(blocks, str):
+                a_parts.append(blocks)
+            usage = mo.get('usage') or {}
+            latency = mo.get('time', '')
+            meta = raw.get('metadata') or {}
+            correct = meta.get('correct_answer', '')
+            if correct:
+                a_parts.append(f"\n---\nCorrect answer: {correct}")
+        else:
+            # Recovery retry line (compact result summary; content not saved)
+            idx = raw.get('sample_index', line_idx)
+            q_text = f"[Truncation recovery retry — sample {idx} (question content not saved)]"
+            verdict = 'correct' if raw.get('correct') else 'incorrect/unfinished'
+            extracted = 'yes' if raw.get('answer_extracted') else 'no'
+            a_parts = [
+                f"Retry result: {verdict}",
+                f"Answer extracted: {extracted} · finish: {raw.get('finish_reason', '')}"
+                f" · latency: {raw.get('latency_s', 0):.0f}s",
+            ]
+            usage = {
+                'input_tokens': raw.get('input_tokens', 0),
+                'output_tokens': raw.get('output_tokens', 0),
+            }
+            latency = raw.get('latency_s', '')
+
+        q_text = q_text.strip() or '[empty prompt]'
+        q_event = {
+            'type': 'user',
+            'uuid': uuid_q,
+            'timestamp': ts,
+            'userType': 'external',
+            'text': q_text[:MAX_TEXT_LEN],
+            'truncated': len(q_text) > MAX_TEXT_LEN,
+        }
+
+        answer_text = '\n\n'.join(a_parts).strip()
+        usage_out = {
+            'input_tokens': usage.get('input_tokens', 0) or 0,
+            'output_tokens': usage.get('output_tokens', 0) or 0,
+        }
+        a_event = {
+            'type': 'assistant',
+            'uuid': uuid_a,
+            'timestamp': ts,
+            'model': '',
+            'usage': usage_out,
+            'stop_reason': raw.get('finish_reason', '') or '',
+        }
+        if answer_text:
+            a_event['text'] = answer_text[:MAX_TEXT_LEN]
+            a_event['truncated'] = len(answer_text) > MAX_TEXT_LEN
+        else:
+            a_event['text'] = '[no output]'
+        if latency not in ('', None):
+            try:
+                a_event['latency_seconds'] = round(float(latency), 1)
+            except (TypeError, ValueError):
+                pass
+        return q_event, a_event
+
+    @classmethod
+    def _read_hermes_bench_events(cls, path, after=None, limit=100, types=None):
+        """Read a Hermes eval run directory into unified events."""
+        run_dir = Path(path)
+
+        manifest = SessionIndex._read_json_file(run_dir / 'run_manifest.json')
+        if manifest is None:
+            manifest = SessionIndex._read_json_file(run_dir / 'recovery_manifest.json')
+        watcher = SessionIndex._read_json_file(run_dir / '.watcher_state.json') or {}
+
+        events = []
+
+        # Run config summary
+        cfg_uuid = 'bench-config'
+        show_config = not after and (not types or 'assistant' in types)
+        if show_config:
+            cfg_lines = []
+            if isinstance(manifest, dict):
+                kind = manifest.get('kind')
+                if kind:
+                    cfg_lines.append(f"Run kind: {kind}")
+                model = manifest.get('model', '')
+                if model:
+                    cfg_lines.append(f"Model: `{Path(model.replace('\\', '/')).name}`")
+                for key in ('benchmark', 'dataset_hub', 'evalscope_version', 'api_url'):
+                    if manifest.get(key):
+                        cfg_lines.append(f"{key}: {manifest[key]}")
+                gc = manifest.get('generation_config') or {}
+                if gc:
+                    cfg_lines.append(
+                        "Sampling: temp={temperature}, top_p={top_p}, top_k={top_k},"
+                        " max_tokens={max_tokens}".format(**{**{
+                            'temperature': '?', 'top_p': '?', 'top_k': '?',
+                            'max_tokens': '?'}, **gc})
+                    )
+            if cfg_lines:
+                events.append({
+                    'type': 'assistant',
+                    'uuid': cfg_uuid,
+                    'timestamp': '',
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                    'text': '**Benchmark config**\n\n' + '\n'.join(cfg_lines),
+                })
+        elif after == cfg_uuid:
+            pass  # cursor on config: proceed to lines
+
+        # Per-sample events with cursor support
+        pred_files = cls._bench_pred_files(run_dir)
+        after_idx = -1
+        if after:
+            m = re.match(r'bench-(\d+)-[qa]$', after)
+            if m:
+                after_idx = int(m.group(1))
+            elif after == 'bench-report':
+                after_idx = 10 ** 12   # everything already consumed
+            # 'bench-config' → after_idx stays -1 (config is emitted above
+            # only on the initial load, so nothing to skip)
+
+        remaining = max(0, limit - len(events))
+        reached_eof = True
+        for pf in pred_files:
+            try:
+                with open(pf, 'r', encoding='utf-8', errors='replace') as f:
+                    for i, line in enumerate(f):
+                        if i <= after_idx:
+                            continue
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            raw = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        q_ev, a_ev = cls._build_bench_line_events(i, raw)
+                        for ev in (q_ev, a_ev):
+                            if ev['type'] in cls._SKIP_TYPES:
+                                continue
+                            if types and ev['type'] not in types:
+                                continue
+                            events.append(ev)
+                            remaining -= 1
+                        if remaining <= 0:
+                            reached_eof = False
+                            break
+            except OSError:
+                continue
+            if remaining <= 0:
+                break
+
+        # Final report summary — only once the whole stream was consumed,
+        # so it never lands mid-pagination.
+        if reached_eof and (not types or 'assistant' in types):
+            report = None
+            reports_dir = run_dir / 'reports'
+            if reports_dir.is_dir():
+                for rep_file in sorted(reports_dir.rglob('*.json')):
+                    candidate = SessionIndex._read_json_file(rep_file)
+                    if candidate and candidate.get('score') is not None:
+                        report = candidate
+                        break
+            rep_bits = []
+            if report:
+                score = report.get('score')
+                num = report.get('num', '')
+                name = report.get('dataset_pretty_name') or report.get('dataset_name', '')
+                pct = f"{score:.1%}" if isinstance(score, (int, float)) else '?'
+                rep_bits.append(f"Final score ({name}): **{pct}** over {num} samples")
+            progress = SessionIndex._read_json_file(run_dir / 'progress.json') or {}
+            candidates_done = [
+                v for v in (
+                    watcher.get('done', watcher.get('completed')),
+                    progress.get('processed_count', progress.get('completed')),
+                ) if isinstance(v, (int, float))
+            ]
+            done = int(max(candidates_done)) if candidates_done else None
+            total = watcher.get('total',
+                    progress.get('total_count', progress.get('total')))
+            status = watcher.get('status') or progress.get('status') or ''
+            if isinstance(total, (int, float)) and done is not None and done >= total > 0:
+                status = 'completed'
+            if status:
+                rep_bits.append(f"Status: {status}" +
+                                (f" ({done}/{int(total)})" if done is not None and total else ""))
+            acc = watcher.get('accuracy', watcher.get('merged_accuracy'))
+            if acc is not None:
+                try:
+                    rep_bits.append(f"Merged accuracy: {float(acc):.1%}")
+                except (TypeError, ValueError):
+                    pass
+            if rep_bits:
+                events.append({
+                    'type': 'assistant',
+                    'uuid': 'bench-report',
+                    'timestamp': '',
+                    'model': '',
+                    'usage': {},
+                    'stop_reason': '',
+                    'text': '**Result**\n\n' + '\n'.join(rep_bits),
+                })
+
+        return events
+
     # ── inline subagent scanning (OpenClaw sessions_spawn) ──────────────
 
     @staticmethod
@@ -2208,7 +3705,7 @@ class SessionEventReader:
         results = {} # toolCallId -> {status, childSessionKey, runId, error}
 
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if not line or 'sessions_spawn' not in line:
@@ -2302,8 +3799,139 @@ class SessionEventReader:
 
     # ── raw event & stats ─────────────────────────────────────────────────
 
-    @staticmethod
-    def get_raw_event(path, event_uuid):
+    # ── raw event & stats ─────────────────────────────────────────────────
+
+    @classmethod
+    def _get_opencode_raw_event(cls, path, event_uuid):
+        ses_id = str(path).split('::', 1)[1]
+        msg_id = event_uuid
+        if msg_id.startswith('ocmsg-'):
+            msg_id = msg_id[len('ocmsg-'):]
+        m = re.match(r'^(msg_.+?)-tr\d*$', msg_id)
+        if m:
+            msg_id = m.group(1)
+
+        try:
+            con = SessionIndex._open_opencode_db_ro()
+        except Exception:
+            return None
+        try:
+            row = con.execute(
+                'SELECT id, time_created, time_updated, data FROM message'
+                ' WHERE session_id = ? AND id = ?',
+                (ses_id, msg_id),
+            ).fetchone()
+            if not row:
+                return None
+            raw = json.loads(row[3])
+            parts = []
+            for r in con.execute(
+                'SELECT data FROM part'
+                ' WHERE session_id = ? AND message_id = ? ORDER BY time_created',
+                (ses_id, msg_id),
+            ):
+                try:
+                    parts.append(json.loads(r[0]))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            raw['_parts'] = parts
+            return raw
+        except (sqlite3.Error, json.JSONDecodeError, ValueError):
+            return None
+        finally:
+            con.close()
+
+    @classmethod
+    def _get_hermes_bench_raw_event(cls, path, event_uuid):
+        run_dir = Path(path)
+
+        if event_uuid == 'bench-config':
+            manifest = SessionIndex._read_json_file(run_dir / 'run_manifest.json')
+            if manifest is None:
+                manifest = SessionIndex._read_json_file(run_dir / 'recovery_manifest.json')
+            return manifest
+
+        if event_uuid == 'bench-report':
+            reports_dir = run_dir / 'reports'
+            if reports_dir.is_dir():
+                for rep_file in sorted(reports_dir.rglob('*.json')):
+                    report = SessionIndex._read_json_file(rep_file)
+                    if report and report.get('score') is not None:
+                        return report
+            return None
+
+        m = re.match(r'bench-(\d+)-[qa]$', event_uuid)
+        if not m:
+            return None
+        line_idx = int(m.group(1))
+        for pf in cls._bench_pred_files(run_dir):
+            try:
+                with open(pf, 'r', encoding='utf-8', errors='replace') as f:
+                    for i, line in enumerate(f):
+                        if i == line_idx:
+                            try:
+                                return json.loads(line.strip())
+                            except json.JSONDecodeError:
+                                return None
+            except OSError:
+                continue
+        return None
+
+    @classmethod
+    def _get_opencode_legacy_raw_event(cls, path, event_uuid):
+        ses_id = str(path).split('::', 1)[1]
+        msg_id = event_uuid
+        if msg_id.startswith('ocmsg-'):
+            msg_id = msg_id[len('ocmsg-'):]
+        m = re.match(r'^(msg_.+?)-tr\d*$', msg_id)
+        if m:
+            msg_id = m.group(1)
+
+        msg_file = OPENCODE_STORAGE_DIR / 'message' / ses_id / f'{msg_id}.json'
+        try:
+            raw = json.loads(msg_file.read_text(encoding='utf-8', errors='replace'))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
+        parts = []
+        p_dir = OPENCODE_STORAGE_DIR / 'part' / msg_id
+        if p_dir.is_dir():
+            for pf in sorted(p_dir.glob('prt_*.json')):
+                try:
+                    parts.append(json.loads(pf.read_text(encoding='utf-8', errors='replace')))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    continue
+        raw['_parts'] = parts
+        return raw
+
+    @classmethod
+    def get_raw_event(cls, path, event_uuid):
+        if cls._is_opencode_path(path):
+            return cls._get_opencode_raw_event(path, event_uuid)
+        if cls._is_legacy_opencode_path(path):
+            return cls._get_opencode_legacy_raw_event(path, event_uuid)
+        if cls._is_hermes_state_path(path):
+            sid = str(path).split('://', 1)[1]
+            m = re.match(r'hstate-(\d+)$', event_uuid)
+            if not m:
+                return None
+            raw = _wsl_hermes_bridge(['raw', sid, m.group(1)], timeout=12)
+            return raw if isinstance(raw, dict) and not raw.get('error') else None
+        if cls._is_hermes_bench_path(path):
+            return cls._get_hermes_bench_raw_event(path, event_uuid)
+        if cls._is_hermes_session_path(path):
+            m = re.match(r'hmsg-(\d+)$', event_uuid)
+            if m:
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                        data = json.load(f)
+                    idx = int(m.group(1))
+                    messages = data.get('messages') or []
+                    if 0 <= idx < len(messages):
+                        return messages[idx]
+                except (OSError, json.JSONDecodeError, ValueError):
+                    pass
+            return None
         try:
             # Codex/Kimi: line-number based lookup
             for prefix in ('codex-', 'kimi-'):
@@ -2312,7 +3940,7 @@ class SessionEventReader:
                         target_line = int(event_uuid[len(prefix):])
                     except (ValueError, IndexError):
                         return None
-                    with open(path, 'r', errors='replace') as f:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as f:
                         for i, line in enumerate(f):
                             if i == target_line:
                                 return json.loads(line.strip())
@@ -2321,7 +3949,7 @@ class SessionEventReader:
             size = os.path.getsize(path)
             # Try tail first
             if size > TAIL_READ_BYTES:
-                with open(path, 'r', errors='replace') as f:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
                     f.seek(max(0, size - TAIL_READ_BYTES))
                     f.readline()
                     for line in f:
@@ -2332,7 +3960,7 @@ class SessionEventReader:
                         except json.JSONDecodeError:
                             pass
             # Full scan
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     try:
                         obj = json.loads(line.strip())
@@ -2344,8 +3972,260 @@ class SessionEventReader:
             pass
         return None
 
-    @staticmethod
-    def get_stats(path):
+    @classmethod
+    def _get_opencode_stats(cls, path):
+        ses_id = str(path).split('::', 1)[1]
+        stats = {
+            'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
+            'tokens': {
+                'input': 0, 'output': 0,
+                'cache_read': 0, 'cache_creation': 0,
+            },
+            'tool_calls': {},
+            'event_counts': {},
+            'first_timestamp': '',
+            'last_timestamp': '',
+            'duration_seconds': 0,
+        }
+        try:
+            con = SessionIndex._open_opencode_db_ro()
+        except Exception:
+            return stats
+        try:
+            row = con.execute(
+                'SELECT directory, version, model, tokens_input, tokens_output,'
+                ' tokens_cache_read, tokens_cache_write, time_created, time_updated'
+                ' FROM session WHERE id = ?',
+                (ses_id,),
+            ).fetchone()
+            if not row:
+                return stats
+            stats['cwd'] = str(row[0] or '')
+            stats['version'] = str(row[1] or '')
+            try:
+                mobj = json.loads(row[2]) if row[2] else {}
+                if isinstance(mobj, dict):
+                    stats['model'] = mobj.get('id', '')
+            except (json.JSONDecodeError, ValueError):
+                stats['model'] = row[2] or ''
+            stats['tokens'] = {
+                'input': row[3] or 0,
+                'output': row[4] or 0,
+                'cache_read': row[5] or 0,
+                'cache_creation': row[6] or 0,
+            }
+            t0, t1 = row[7] or 0, row[8] or 0
+            stats['first_timestamp'] = cls._ms_to_iso(t0)
+            stats['last_timestamp'] = cls._ms_to_iso(t1)
+            stats['duration_seconds'] = int((t1 - t0) / 1000) if t1 and t0 else 0
+
+            for r in con.execute(
+                'SELECT data FROM message WHERE session_id = ?', (ses_id,)
+            ):
+                try:
+                    role = json.loads(r[0]).get('role', '?')
+                except (json.JSONDecodeError, ValueError):
+                    role = '?'
+                stats['event_counts'][role] = stats['event_counts'].get(role, 0) + 1
+
+            for r in con.execute(
+                'SELECT data FROM part'
+                ' WHERE session_id = ? LIMIT 20000',
+                (ses_id,),
+            ):
+                try:
+                    pdata = json.loads(r[0])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if pdata.get('type') != 'tool':
+                    continue
+                tool_name = pdata.get('tool', '') or 'unknown'
+                stats['tool_calls'][tool_name] = stats['tool_calls'].get(tool_name, 0) + 1
+        except sqlite3.Error:
+            pass
+        finally:
+            con.close()
+        return stats
+
+    @classmethod
+    def _get_hermes_bench_stats(cls, path):
+        run_dir = Path(path)
+        stats = {
+            'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
+            'tokens': {
+                'input': 0, 'output': 0,
+                'cache_read': 0, 'cache_creation': 0,
+            },
+            'tool_calls': {},
+            'event_counts': {'sample': 0, 'correct': 0},
+            'first_timestamp': '',
+            'last_timestamp': '',
+            'duration_seconds': 0,
+        }
+        manifest = SessionIndex._read_json_file(run_dir / 'run_manifest.json')
+        if manifest is None:
+            manifest = SessionIndex._read_json_file(run_dir / 'recovery_manifest.json')
+        if isinstance(manifest, dict):
+            model = manifest.get('model', '')
+            stats['model'] = Path(model.replace('\\', '/')).name if model else ''
+            stats['version'] = str(manifest.get('evalscope_version', '') or '')
+            stats['cwd'] = str(manifest.get('api_url', '') or '')
+
+        first_ts = last_ts = None
+        probe = run_dir / 'run_manifest.json'
+        if not probe.exists():
+            probe = run_dir / 'recovery_manifest.json'
+        try:
+            if probe.exists():
+                first_ts = probe.stat().st_mtime
+            last_ts = run_dir.stat().st_mtime
+        except OSError:
+            pass
+
+        for pf in cls._bench_pred_files(run_dir):
+            try:
+                st = pf.stat()
+                if first_ts is None or st.st_mtime < first_ts:
+                    first_ts = st.st_mtime
+                if last_ts is None or st.st_mtime > last_ts:
+                    last_ts = st.st_mtime
+                with open(pf, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            raw = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        stats['event_counts']['sample'] += 1
+                        if 'messages' in raw:
+                            usage = ((raw.get('model_output') or {}).get('usage') or {})
+                            stats['tokens']['input'] += usage.get('input_tokens', 0) or 0
+                            stats['tokens']['output'] += usage.get('output_tokens', 0) or 0
+                        else:
+                            stats['tokens']['input'] += raw.get('input_tokens', 0) or 0
+                            stats['tokens']['output'] += raw.get('output_tokens', 0) or 0
+                            if raw.get('correct'):
+                                stats['event_counts']['correct'] += 1
+            except OSError:
+                continue
+
+        if first_ts:
+            stats['first_timestamp'] = datetime.fromtimestamp(first_ts).isoformat()
+        if last_ts:
+            stats['last_timestamp'] = datetime.fromtimestamp(last_ts).isoformat()
+        if first_ts and last_ts:
+            stats['duration_seconds'] = int(last_ts - first_ts)
+
+        # Final score from report
+        reports_dir = run_dir / 'reports'
+        if reports_dir.is_dir():
+            for rep_file in sorted(reports_dir.rglob('*.json')):
+                report = SessionIndex._read_json_file(rep_file)
+                if report and report.get('score') is not None:
+                    stats['event_counts']['final_score'] = report.get('score')
+                    break
+        return stats
+
+    @classmethod
+    def _get_opencode_legacy_stats(cls, path):
+        ses_id = str(path).split('::', 1)[1]
+        stats = {
+            'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
+            'tokens': {
+                'input': 0, 'output': 0,
+                'cache_read': 0, 'cache_creation': 0,
+            },
+            'tool_calls': {},
+            'event_counts': {},
+            'first_timestamp': '',
+            'last_timestamp': '',
+            'duration_seconds': 0,
+        }
+
+        sess_file = None
+        sess_dir = OPENCODE_STORAGE_DIR / 'session'
+        if sess_dir.is_dir():
+            for pd in sess_dir.iterdir():
+                cand = pd / f'{ses_id}.json'
+                if cand.exists():
+                    sess_file = cand
+                    break
+        if sess_file:
+            try:
+                d = json.loads(sess_file.read_text(encoding='utf-8', errors='replace'))
+                stats['cwd'] = str(d.get('directory') or '')
+                stats['version'] = str(d.get('version') or '')
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+
+        msg_dir = OPENCODE_STORAGE_DIR / 'message' / ses_id
+        if not msg_dir.is_dir():
+            return stats
+
+        first_ms = last_ms = None
+        last_model_ts = -1
+        msg_ids = []
+        for mf in msg_dir.glob('msg_*.json'):
+            try:
+                d = json.loads(mf.read_text(encoding='utf-8', errors='replace'))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            msg_ids.append(d.get('id') or mf.stem)
+            role = d.get('role', '?')
+            stats['event_counts'][role] = stats['event_counts'].get(role, 0) + 1
+            t0 = ((d.get('time') or {}).get('created')) or 0
+            if role == 'assistant':
+                tk = d.get('tokens') or {}
+                stats['tokens']['input'] += tk.get('input', 0) or 0
+                stats['tokens']['output'] += tk.get('output', 0) or 0
+                cache = tk.get('cache') or {}
+                stats['tokens']['cache_read'] += cache.get('read', 0) or 0
+                stats['tokens']['cache_creation'] += cache.get('write', 0) or 0
+                if t0 >= last_model_ts and d.get('modelID'):
+                    last_model_ts = t0
+                    stats['model'] = d['modelID']
+            if t0:
+                if first_ms is None or t0 < first_ms:
+                    first_ms = t0
+                if last_ms is None or t0 > last_ms:
+                    last_ms = t0
+
+        # Tool parts live under part/<messageID>/ — check each message's dir
+        p_root = OPENCODE_STORAGE_DIR / 'part'
+        for mid in msg_ids:
+            p_dir = p_root / mid
+            if not p_dir.is_dir():
+                continue
+            for pf in p_dir.glob('prt_*.json'):
+                try:
+                    pdata = json.loads(pf.read_text(encoding='utf-8', errors='replace'))
+                except (OSError, json.JSONDecodeError, ValueError):
+                    continue
+                if pdata.get('type') != 'tool':
+                    continue
+                tool_name = pdata.get('tool', '') or 'unknown'
+                stats['tool_calls'][tool_name] = stats['tool_calls'].get(tool_name, 0) + 1
+
+        stats['first_timestamp'] = cls._ms_to_iso(first_ms)
+        stats['last_timestamp'] = cls._ms_to_iso(last_ms)
+        if first_ms and last_ms:
+            stats['duration_seconds'] = int((last_ms - first_ms) / 1000)
+        return stats
+
+    @classmethod
+    def get_stats(cls, path):
+        if cls._is_opencode_path(path):
+            return cls._get_opencode_stats(path)
+        if cls._is_legacy_opencode_path(path):
+            return cls._get_opencode_legacy_stats(path)
+        if cls._is_hermes_state_path(path):
+            return cls._get_hermes_state_stats(path)
+        if cls._is_hermes_session_path(path):
+            return cls._get_hermes_stats(path)
+        if cls._is_hermes_bench_path(path):
+            return cls._get_hermes_bench_stats(path)
         stats = {
             'model': '', 'version': '', 'cwd': '', 'gitBranch': '',
             'tokens': {
@@ -2361,7 +4241,7 @@ class SessionEventReader:
         first_ts = last_ts = None
 
         try:
-            with open(path, 'r', errors='replace') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -2622,8 +4502,8 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 date_from=qs.get('date_from', [None])[0],
                 date_to=qs.get('date_to', [None])[0],
                 sort=qs.get('sort', ['mtime'])[0],
-                offset=int(qs.get('offset', ['0'])[0]),
-                limit=min(int(qs.get('limit', ['50'])[0]), 200),
+                offset=self._qint(qs, 'offset', 0),
+                limit=min(self._qint(qs, 'limit', 50), 200),
                 source=qs.get('source', [None])[0],
                 content_q=qs.get('content_q', [None])[0],
             )
@@ -2640,7 +4520,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
 
             after = qs.get('after', [None])[0]
             full = qs.get('full', [''])[0] == '1'
-            limit = min(int(qs.get('limit', ['100'])[0]), 10000 if full else 500)
+            limit = min(self._qint(qs, 'limit', 100), 10000 if full else 500)
             types_raw = qs.get('types', [None])[0]
             types = set(types_raw.split(',')) if types_raw else None
 
@@ -2739,7 +4619,15 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json({'error': str(e)}, status=500)
 
-    # ── Shared helpers ────────────────────────────────────────────────────
+    # ── Shared helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _qint(qs, key, default):
+        """Parse an integer query param, falling back on bad input."""
+        try:
+            return int(qs.get(key, [default])[0])
+        except (TypeError, ValueError):
+            return default
 
     def send_json(self, data, status=200):
         self.send_response(status)
@@ -2757,10 +4645,178 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
             files = sorted(LOG_DIR.glob('session_*_events.jsonl'), reverse=True)
         return files
 
-    def collect_status(self):
+    # ── Windows status collection ───────────────────────────────────────
+
+    _PS_COLLECT_SCRIPT = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$cpu=@{};"
+        "Get-CimInstance Win32_PerfFormattedData_PerfProc_Process"
+        " -Filter \"Name != 'Idle' AND Name != '_Total'\" | ForEach-Object"
+        " { $cpu[[uint32]$_.IDProcess]=[double]$_.PercentProcessorTime };"
+        "$procs=@();"
+        "Get-CimInstance Win32_Process | ForEach-Object {"
+        " $cl=$_.CommandLine; if(-not $cl){return}"
+        " $l=$cl.ToLower();"
+        " if(-not $l.Contains('claude')){return}"
+        " if($l.Contains('claude-tracker') -or $l.Contains('claude-monitor')"
+        "   -or $l.Contains('serve-dashboard')){return}"
+        " $t='claude-code';"
+        " if($l.Contains('mcp-server')){$t='mcp-server'}"
+        " elseif($l.Contains('worker-service')){$t='worker'}"
+        " elseif($l.Contains('chroma')){$t='chroma'}"
+        " $c=$cpu[[uint32]$_.ProcessId];"
+        " $procs += [pscustomobject]@{ pid=$_.ProcessId; type=$t;"
+        "   mem=[math]::Round([double]$_.WorkingSetSize/1MB);"
+        "   cpu=[math]::Round([double]$c,1); state='S' }"
+        " };"
+        "$swap=0;"
+        "Get-CimInstance Win32_PageFileUsage | ForEach-Object"
+        " { $swap += $_.CurrentUsage };"
+        "[pscustomobject]@{ swap=$swap; procs=$procs }"
+        " | ConvertTo-Json -Compress -Depth 3"
+    )
+
+    _WIN_STATUS_CACHE = {'ts': 0.0, 'data': None}
+    _WIN_STATUS_LOCK = threading.Lock()
+    _WIN_STATUS_TTL = 1.5  # seconds; dashboard polls /status every ~2-3s
+
+    def _collect_windows_status(self):
+        """Claude processes via CIM + system memory via GlobalMemoryStatusEx."""
+        system = {'available_mb': 0, 'total_mb': 0, 'swap_used_mb': 0}
         processes = []
         total_mem = 0
+
+        # Memory is instant and dependency-free: no /proc on Windows.
+        try:
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            st = _MemoryStatusEx()
+            st.dwLength = ctypes.sizeof(st)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                total_mb = st.ullTotalPhys // 1048576
+                avail_mb = st.ullAvailPhys // 1048576
+                # Commit charge minus physical usage approximates swap use.
+                swap_mb = max(
+                    0,
+                    (st.ullTotalPageFile - st.ullAvailPageFile) // 1048576
+                    - (total_mb - avail_mb),
+                )
+                system = {
+                    'available_mb': avail_mb,
+                    'total_mb': total_mb,
+                    'swap_used_mb': swap_mb,
+                }
+        except (AttributeError, OSError):
+            pass
+
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive',
+                 '-Command', self._PS_COLLECT_SCRIPT],
+                capture_output=True, timeout=10,
+            )
+            out = (result.stdout or b'').decode('utf-8', errors='replace').strip()
+            payload = json.loads(out) if out else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if isinstance(payload.get('swap'), (int, float)):
+                system['swap_used_mb'] = int(payload['swap'])
+            rows = payload.get('procs') or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            for r in rows:
+                try:
+                    mem_mb = int(r['mem'] or 0)
+                    total_mem += mem_mb
+                    processes.append({
+                        'pid': str(r['pid']),
+                        'type': r['type'] or 'claude-code',
+                        'memory': mem_mb,
+                        'cpu': float(r['cpu'] or 0),
+                        'state': 'S',
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError,
+                ValueError) as e:
+            print(f"Error collecting Windows processes: {e}", file=sys.stderr)
+
+        return processes, system, total_mem
+
+    def collect_status(self):
+        now = time.time()
+        if os.name == 'nt':
+            with self._WIN_STATUS_LOCK:
+                cached = self._WIN_STATUS_CACHE
+                if cached['data'] is not None \
+                        and now - cached['ts'] < self._WIN_STATUS_TTL:
+                    return cached['data']
+                processes, system, total_mem = self._collect_windows_status()
+                data = self._compose_status(processes, system, total_mem)
+                cached['ts'] = now
+                cached['data'] = data
+                return data
+        processes, system, total_mem = self._collect_unix_status()
+        return self._compose_status(processes, system, total_mem)
+
+    def _compose_status(self, processes, system, total_mem):
         counts = {'claude': 0, 'mcp': 0, 'worker': 0, 'chroma': 0}
+        for p in processes:
+            if p['type'] == 'mcp-server':
+                counts['mcp'] += 1
+            elif p['type'] == 'worker':
+                counts['worker'] += 1
+            elif p['type'] == 'chroma':
+                counts['chroma'] += 1
+            else:
+                counts['claude'] += 1
+
+        log_date = datetime.now().strftime('%Y%m%d')
+
+        # Detect process changes and log events
+        _detect_and_log_events(processes, total_mem)
+
+        # Re-read recent events (now includes any just-logged ones)
+        recent_events = self.get_recent_events(limit=20)
+        # Re-count anomalies from updated file
+        anomaly_count = 0
+        today_file = self._get_today_event_file()
+        if today_file.exists():
+            try:
+                with open(today_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if '"ANOMALY' in line:
+                            anomaly_count += 1
+            except (OSError, IOError):
+                pass
+
+        system_used_mb = max(0, system.get('total_mb', 0) - system.get('available_mb', 0))
+
+        return {
+            'processes': processes,
+            'total_mem_mb': total_mem,
+            'system_used_mb': system_used_mb,
+            'counts': f"claude:{counts['claude']},mcp:{counts['mcp']},worker:{counts['worker']},chroma:{counts['chroma']}",
+            'system': system,
+            'recent_events': recent_events,
+            'session_id': log_date,
+            'anomaly_count': anomaly_count,
+        }
+
+    def _collect_unix_status(self):
+        processes = []
+        total_mem = 0
 
         try:
             result = subprocess.run(
@@ -2788,15 +4844,10 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 proc_type = 'claude-code'
                 if 'mcp-server' in cmdline:
                     proc_type = 'mcp-server'
-                    counts['mcp'] += 1
                 elif 'worker-service' in cmdline:
                     proc_type = 'worker'
-                    counts['worker'] += 1
                 elif 'chroma' in cmdline:
                     proc_type = 'chroma'
-                    counts['chroma'] += 1
-                else:
-                    counts['claude'] += 1
 
                 total_mem += mem_mb
                 processes.append({
@@ -2829,37 +4880,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         except (OSError, ValueError, subprocess.SubprocessError) as e:
             print(f"Warning: Could not read system memory: {e}", file=sys.stderr)
 
-        log_date = datetime.now().strftime('%Y%m%d')
-
-        # Detect process changes and log events
-        _detect_and_log_events(processes, total_mem)
-
-        # Re-read recent events (now includes any just-logged ones)
-        recent_events = self.get_recent_events(limit=20)
-        # Re-count anomalies from updated file
-        anomaly_count = 0
-        today_file = self._get_today_event_file()
-        if today_file.exists():
-            try:
-                with open(today_file, 'r') as f:
-                    for line in f:
-                        if '"ANOMALY' in line:
-                            anomaly_count += 1
-            except (OSError, IOError):
-                pass
-
-        system_used_mb = max(0, system.get('total_mb', 0) - system.get('available_mb', 0))
-
-        return {
-            'processes': processes,
-            'total_mem_mb': total_mem,
-            'system_used_mb': system_used_mb,
-            'counts': f"claude:{counts['claude']},mcp:{counts['mcp']},worker:{counts['worker']},chroma:{counts['chroma']}",
-            'system': system,
-            'recent_events': recent_events,
-            'session_id': log_date,
-            'anomaly_count': anomaly_count,
-        }
+        return processes, system, total_mem
 
     def get_recent_events(self, limit=50):
         events = []
@@ -2886,7 +4907,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
     def _read_last_events(self, filepath, limit):
         events = []
         try:
-            with open(filepath, 'r') as f:
+            with open(filepath, 'r', encoding='utf-8') as f:
                 last_lines = deque(f, maxlen=limit)
                 for line in last_lines:
                     try:
@@ -2915,7 +4936,7 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
             if event_file.exists():
                 summary['has_data'] = True
                 try:
-                    with open(event_file, 'r') as f:
+                    with open(event_file, 'r', encoding='utf-8') as f:
                         for line in f:
                             summary['total_events'] += 1
                             try:
@@ -2949,8 +4970,11 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
 
 # ─── Server ────────────────────────────────────────────────────────────────────
 
-class ReuseAddrTCPServer(socketserver.TCPServer):
+class ReuseAddrTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Threaded so slow requests (ripgrep content search, big Codex tails)
+    never block the dashboard's concurrent pollers."""
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def main():

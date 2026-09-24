@@ -31,6 +31,8 @@
             --progress-color: #06b6d4;
             --kimi-color: #8a2be2;
             --droid-color: #e74c3c;
+            --opencode-color: #ff6b35;
+            --hermes-color: #fbbf24;
 
             --scanline-opacity: 0.03;
             --glow-intensity: 0.6;
@@ -965,6 +967,21 @@
             color: var(--droid-color);
         }
 
+        .session-badge.source-opencode {
+            background: rgba(255, 107, 53, 0.15);
+            color: var(--opencode-color);
+        }
+
+        .session-badge.source-hermes-bench {
+            background: rgba(251, 191, 36, 0.15);
+            color: var(--hermes-color);
+        }
+
+        .session-badge.source-hermes {
+            background: rgba(251, 191, 36, 0.15);
+            color: var(--hermes-color);
+        }
+
         .session-status-dot {
             width: 6px;
             height: 6px;
@@ -1819,6 +1836,9 @@
                                     <option value="codex">Codex CLI</option>
                                     <option value="kimi">Kimi Code</option>
                                     <option value="droid">Droid</option>
+                                    <option value="opencode">OpenCode</option>
+                                    <option value="hermes-bench">Hermes Bench</option>
+                                    <option value="hermes">Hermes Agent</option>
                                 </select>
                             </div>
                             <div class="filter-row">
@@ -2395,7 +2415,7 @@
                     const proj = escapeHtml(s.project || '');
                     const model = shortModel(s.model);
                     const src = s.source || 'claude';
-                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex', kimi: 'Kimi', droid: 'Droid'}[src] || src;
+                    const srcLabel = {claude: 'CC', openclaw: 'OC', codex: 'Codex', kimi: 'Kimi', droid: 'Droid', opencode: 'OE', 'hermes-bench': 'Bench', hermes: 'HM'}[src] || src;
                     return '<div class="session-item' + sel + active + '" data-id="' + escapeHtml(s.sessionId) + '" onclick="selectSession(\'' + escapeHtml(s.sessionId) + '\')">' +
                         '<div class="session-slug">' + slug + '</div>' +
                         '<div class="session-meta">' +
@@ -2539,12 +2559,12 @@
         async function pollNewEvents() {
             if (pollNewEventsBusy) return;
             if (!svSelectedId) return;
-            pollNewEventsBusy = true;
             // Don't poll for ephemeral subagents (no session file)
             if (svViewingSubagent) {
                 const sa = svSubagents.find(s => s.id === svViewingSubagent);
                 if (sa && sa.ephemeral) return;
             }
+            pollNewEventsBusy = true;
             const targetId = svViewingSubagent || svSelectedId;
             try {
                 const url = svLastEventUUID
@@ -2555,7 +2575,14 @@
                 const data = await res.json();
                 if (data.events && data.events.length > 0) {
                     svEvents = svEvents.concat(data.events);
-                    svLastEventUUID = data.events[data.events.length - 1].uuid;
+                    // Skip uuid-less events (should be filtered server-side,
+                    // but never hand an empty cursor back to ?after=)
+                    for (let i = data.events.length - 1; i >= 0; i--) {
+                        if (data.events[i].uuid) {
+                            svLastEventUUID = data.events[i].uuid;
+                            break;
+                        }
+                    }
 
                     // DOM limit
                     if (svEvents.length > 500) {
