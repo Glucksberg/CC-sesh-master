@@ -92,7 +92,11 @@ LAST_SNAPSHOT_TIME=0
 REPORT_INTERVAL=14400   # 4 hours in seconds
 SNAPSHOT_INTERVAL=300    # 5 minutes
 
-# Telegram notification config (set env vars or PM2 ecosystem config)
+# Telegram notification config
+# Este repositório é público: credenciais vêm de fora dele, nunca embutidas.
+CC_SESH_SECRETS="${CC_SESH_SECRETS:-/home/dev/deploy/secrets/cc-sesh.env}"
+[ -r "$CC_SESH_SECRETS" ] && . "$CC_SESH_SECRETS"
+
 TELEGRAM_BOT_TOKEN="${TRACKER_TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TRACKER_TELEGRAM_CHAT_ID:-}"
 TELEGRAM_ENABLED="${TRACKER_TELEGRAM_ENABLED:-1}"

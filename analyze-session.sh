@@ -15,8 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 
 # Telegram config (same as tracker)
-TELEGRAM_BOT_TOKEN="${TRACKER_TELEGRAM_BOT_TOKEN:-7307131738:AAHi8UUh7DaPbxRGmNMXJMH47S-YptUvrUM}"
-TELEGRAM_CHAT_ID="${TRACKER_TELEGRAM_CHAT_ID:--1002912787560}"
+# Este repositório é público: credenciais vêm de fora dele, nunca embutidas.
+CC_SESH_SECRETS="${CC_SESH_SECRETS:-/home/dev/deploy/secrets/cc-sesh.env}"
+[ -r "$CC_SESH_SECRETS" ] && . "$CC_SESH_SECRETS"
+
+TELEGRAM_BOT_TOKEN="${TRACKER_TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TRACKER_TELEGRAM_CHAT_ID:-}"
 
 SEND_TELEGRAM=0
 
@@ -358,6 +362,11 @@ echo "════════════════════════�
 
 # ── Telegram Summary ──
 if [ "$SEND_TELEGRAM" -eq 1 ]; then
+    if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+        echo "ERROR: Telegram is not configured; set TRACKER_TELEGRAM_BOT_TOKEN and TRACKER_TELEGRAM_CHAT_ID outside this repository." >&2
+        exit 1
+    fi
+
     echo ""
     echo "Sending summary to Telegram..."
 

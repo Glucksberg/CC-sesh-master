@@ -139,7 +139,8 @@ class LineOffsetTest(unittest.TestCase):
             size = p.stat().st_size
             # Tail window returns only events inside the last TAIL_READ_BYTES,
             # but each uuid must equal codex-<absolute line number>.
-            evs = SER._read_codex_events(p, size, None, 500, None)
+            evs = SER._read_codex_events(p, size, before=None, limit=500,
+                                         types=None)
             self.assertTrue(evs)
             # determine returned window precisely via uuids
             uuids = {e['uuid'] for e in evs}
@@ -150,7 +151,8 @@ class LineOffsetTest(unittest.TestCase):
                 idx = int(e['uuid'].split('-')[1])
                 self.assertEqual(e['tool_uses'][0]['name'], 'Bash')
             # after-cursor pagination picks up from an absolute line number
-            after = SER._read_codex_events(p, size, 'codex-195', 500, None)
+            after = SER._read_codex_events(p, size, after='codex-195',
+                                           limit=500, types=None)
             self.assertEqual(after[0]['uuid'], 'codex-196')
 
 
@@ -167,6 +169,16 @@ class HermesConversionTest(unittest.TestCase):
                      for k in range(5)]
         evs = SER._select_converted(converted, 'hmsg', 'garbage', 100, None)
         self.assertEqual(len(evs), 5)
+
+    def test_select_converted_before_returns_earlier(self):
+        converted = [(k, {'type': 'user', 'uuid': f'hstate-{k}'})
+                     for k in range(10)]
+        evs = SER._select_converted(converted, 'hstate', None, 4, None,
+                                    before='hstate-6')
+        self.assertEqual([e['uuid'] for e in evs],
+                         [f'hstate-{k}' for k in range(2, 6)])
+        self.assertEqual(SER._select_converted(
+            converted, 'hstate', None, 10, None, before='hstate-0'), [])
 
     def test_system_role_skipped_and_tool_content_flattened(self):
         converted = SER._convert_openai_messages('hstate', [

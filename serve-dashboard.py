@@ -125,8 +125,11 @@ CLAUDE_DIR = Path.home() / '.claude'
 PROJECTS_DIR = CLAUDE_DIR / 'projects'
 HISTORY_FILE = CLAUDE_DIR / 'history.jsonl'
 OPENCLAW_DIR = Path.home() / '.openclaw' / 'agents'
+OPENCLAW_SQLITE_NAME = 'openclaw-agent.sqlite'
+OPENCLAW_SQLITE_PREFIX = 'openclaw-sqlite:'
 CODEX_DIR = Path.home() / '.codex' / 'sessions'
 CODEX_ARCHIVED_DIR = Path.home() / '.codex' / 'archived_sessions'
+CODEX_INDEX_FILE = Path.home() / '.codex' / 'session_index.jsonl'
 _kimi_share = os.environ.get('KIMI_SHARE_DIR', '').strip()
 KIMI_DIR = Path(_kimi_share) if _kimi_share else Path.home() / '.kimi' / 'sessions'
 DROID_DIR = Path.home() / '.factory' / 'sessions'
@@ -417,7 +420,8 @@ class SessionIndex:
     def rebuild(self):
         sessions = {}
         subagents = {}      # parentId -> [subagent_info, ...]
-        subagent_paths = {} # filename_stem -> path str
+        subagent_paths = {} # subagent ID -> path str
+        codex_subagents = {}  # subagentId -> pending Codex subagent info
         projects = set()
 
         # ── Scan ~/.claude/projects/ ─────────────────────────────────
@@ -478,18 +482,29 @@ class SessionIndex:
                     if not agent_dir.is_dir():
                         continue
                     sess_dir = agent_dir / 'sessions'
-                    if not sess_dir.is_dir():
-                        continue
                     display = 'openclaw/' + agent_dir.name
-                    self._scan_session_dir(
-                        sess_dir, display, sessions, subagents,
-                        subagent_paths, projects, source='openclaw',
-                    )
+                    if sess_dir.is_dir():
+                        self._scan_session_dir(
+                            sess_dir, display, sessions, subagents,
+                            subagent_paths, projects, source='openclaw',
+                        )
+
+                    sqlite_path = agent_dir / 'agent' / OPENCLAW_SQLITE_NAME
+                    if sqlite_path.is_file():
+                        self._scan_openclaw_sqlite(
+                            sqlite_path, display, sessions, projects,
+                        )
 
         # ── Scan ~/.codex/sessions/ (Windows + WSL) ────────────────────
         for codex_dir in [CODEX_DIR, CODEX_ARCHIVED_DIR] + WSL_CODEX_DIRS + WSL_CODEX_ARCHIVED_DIRS:
             if codex_dir.exists():
-                self._scan_codex_sessions(codex_dir, sessions, projects)
+                self._scan_codex_sessions(
+                    codex_dir, sessions, projects, codex_subagents,
+                )
+
+        self._attach_codex_subagents(
+            sessions, subagents, subagent_paths, codex_subagents,
+        )
 
         # ── Scan ~/.kimi/sessions/ (Windows + WSL) ───────────────────
         for kimi_dir in [KIMI_DIR] + WSL_KIMI_DIRS:
@@ -603,6 +618,77 @@ class SessionIndex:
                 'duration': duration,
                 'contextPct': context_pct,
                 '_path': str(jsonl_file),
+            }
+
+    def _scan_openclaw_sqlite(self, db_path, display, sessions, projects):
+        """Scan sessions stored by newer OpenClaw releases in SQLite."""
+        try:
+            with sqlite3.connect(
+                f'file:{db_path}?mode=ro', uri=True, timeout=2,
+            ) as conn:
+                rows = conn.execute('''
+                    SELECT s.session_id, s.created_at, s.updated_at,
+                           s.started_at, s.ended_at, s.status,
+                           s.model_provider, s.model, s.display_name,
+                           COUNT(t.seq), COALESCE(SUM(LENGTH(t.event_json)), 0),
+                           json_extract(e.entry_json, '$.totalTokens'),
+                           json_extract(first_event.event_json, '$.cwd')
+                    FROM sessions s
+                    LEFT JOIN transcript_events t
+                      ON t.session_id = s.session_id
+                    LEFT JOIN session_entries e
+                      ON e.session_key = s.session_key
+                    LEFT JOIN transcript_events first_event
+                      ON first_event.session_id = s.session_id
+                     AND first_event.seq = 0
+                    GROUP BY s.session_id
+                ''').fetchall()
+        except (OSError, sqlite3.Error) as e:
+            print(f'OpenClaw SQLite scan failed for {db_path}: {e}', file=sys.stderr)
+            return
+
+        for row in rows:
+            (sid, created_ms, updated_ms, started_ms, ended_ms, raw_status,
+             provider, model, display_name, event_count, size,
+             total_tokens, cwd) = row
+            if not isinstance(sid, str) or not re.fullmatch(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                sid,
+            ):
+                continue
+
+            updated_ms = updated_ms or created_ms or 0
+            mtime = updated_ms / 1000
+            age = time.time() - mtime
+            terminal = raw_status in ('done', 'failed', 'killed', 'timeout')
+            active = age < 120 and not terminal
+            start_ms = started_ms or created_ms or updated_ms
+            end_ms = ended_ms or updated_ms
+            duration = max(0, int((end_ms - start_ms) / 1000))
+            full_model = model or ''
+            if provider and full_model and '/' not in full_model:
+                full_model = f'{provider}/{full_model}'
+            ctx_size = self._get_context_size(full_model)
+            context_pct = round((total_tokens / ctx_size) * 100) if ctx_size and total_tokens else 0
+
+            projects.add(display)
+            sessions[sid] = {
+                'sessionId': sid,
+                'project': display,
+                'source': 'openclaw',
+                'slug': display_name or '',
+                'status': 'active' if active else 'completed',
+                'model': full_model,
+                'version': 'sqlite',
+                'mtime': mtime,
+                'size': size or 0,
+                'eventCount': event_count or 0,
+                'cwd': cwd or '',
+                'gitBranch': '',
+                'subagentCount': 0,
+                'duration': duration,
+                'contextPct': context_pct,
+                '_path': f'{OPENCLAW_SQLITE_PREFIX}{db_path}#{sid}',
             }
 
     # ── metadata helpers ──────────────────────────────────────────────────
@@ -838,8 +924,9 @@ class SessionIndex:
 
     # ── Codex session scanning ─────────────────────────────────────────────
 
-    def _scan_codex_sessions(self, base_dir, sessions, projects):
+    def _scan_codex_sessions(self, base_dir, sessions, projects, codex_subagents):
         """Scan ~/.codex/sessions/ for rollout-*.jsonl files."""
+        session_names = self._load_codex_session_names(base_dir)
         for jsonl_file in base_dir.rglob('rollout-*.jsonl'):
             try:
                 st = jsonl_file.stat()
@@ -854,7 +941,10 @@ class SessionIndex:
             if meta is None:
                 continue
 
-            sid = 'codex-' + meta.get('id', jsonl_file.stem)
+            raw_id = meta.get('id') or jsonl_file.stem
+            if not isinstance(raw_id, str):
+                raw_id = jsonl_file.stem
+            sid = 'codex-' + raw_id
             cwd = meta.get('cwd', '')
             # Project display: codex/ + relative cwd
             home_prefix = str(Path.home()) + '/'
@@ -875,11 +965,11 @@ class SessionIndex:
             ctx_size = self._get_context_size(model)
             context_pct = round((last_input / ctx_size) * 100) if ctx_size and last_input else 0
 
-            sessions[sid] = {
+            session = {
                 'sessionId': sid,
                 'project': display,
                 'source': 'codex',
-                'slug': meta.get('slug', ''),
+                'slug': session_names.get(raw_id) or meta.get('slug', ''),
                 'status': 'active' if active else 'completed',
                 'model': meta.get('model', ''),
                 'version': meta.get('version', ''),
@@ -893,6 +983,113 @@ class SessionIndex:
                 'contextPct': context_pct,
                 '_path': str(jsonl_file),
             }
+
+            parent_raw_id = meta.get('parent_thread_id') or meta.get('forked_from_id')
+            if (meta.get('thread_source') == 'subagent'
+                    and isinstance(parent_raw_id, str) and parent_raw_id):
+                parent_id = (parent_raw_id if parent_raw_id.startswith('codex-')
+                             else 'codex-' + parent_raw_id)
+                agent_path = meta.get('agent_path', '')
+                if not isinstance(agent_path, str):
+                    agent_path = ''
+                agent_nickname = meta.get('agent_nickname', '')
+                if not isinstance(agent_nickname, str):
+                    agent_nickname = ''
+                agent_label = agent_path.strip('/').rsplit('/', 1)[-1] if agent_path else ''
+                if agent_nickname:
+                    agent_label = (f'{agent_label} ({agent_nickname})'
+                                   if agent_label else agent_nickname)
+
+                codex_subagents[sid] = {
+                    'parentId': parent_id,
+                    'session': session,
+                    'subagent': {
+                        'id': sid,
+                        'parentId': parent_id,
+                        'agentType': 'codex-subagent',
+                        'filename': jsonl_file.name,
+                        'size': size,
+                        'mtime': mtime,
+                        'eventCount': meta.get('event_count', 0),
+                        'slug': agent_label or meta.get('slug', ''),
+                        'model': model,
+                        'status': session['status'],
+                        'agentPath': agent_path,
+                    },
+                }
+                continue
+
+            sessions[sid] = session
+
+    @staticmethod
+    def _attach_codex_subagents(sessions, subagents, subagent_paths,
+                                codex_subagents):
+        """Attach Codex subagents to their nearest indexed parent session."""
+        root_session_ids = set(sessions)
+
+        def find_parent_id(parent_id):
+            seen = set()
+            while parent_id not in root_session_ids:
+                if parent_id in seen:
+                    return None
+                seen.add(parent_id)
+                parent = codex_subagents.get(parent_id)
+                if not parent:
+                    return None
+                parent_id = parent['parentId']
+            return parent_id
+
+        for candidate in codex_subagents.values():
+            parent_id = find_parent_id(candidate['parentId'])
+            if not parent_id:
+                # Keep orphaned subagents visible rather than losing their history.
+                session = candidate['session']
+                sessions[session['sessionId']] = session
+                continue
+
+            subagent = dict(candidate['subagent'])
+            subagent['parentId'] = parent_id
+            children = subagents.setdefault(parent_id, [])
+            if any(existing.get('id') == subagent['id'] for existing in children):
+                continue
+            children.append(subagent)
+            subagent_paths[subagent['id']] = candidate['session']['_path']
+
+        for parent_id, children in subagents.items():
+            parent = sessions.get(parent_id)
+            if parent and parent.get('source') == 'codex':
+                children.sort(key=lambda child: child.get('mtime', 0), reverse=True)
+                parent['subagentCount'] = len(children)
+
+    @staticmethod
+    def _load_codex_session_names(base_dir):
+        """Load renamed Codex thread titles from ~/.codex/session_index.jsonl."""
+        index_file = CODEX_INDEX_FILE
+        try:
+            if base_dir != CODEX_DIR:
+                index_file = base_dir.parent / 'session_index.jsonl'
+        except OSError:
+            pass
+
+        names = {}
+        try:
+            with open(index_file, 'r', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sid = obj.get('id')
+                    name = obj.get('thread_name')
+                    clean_name = str(name).strip() if name else ''
+                    if sid and clean_name:
+                        names[sid] = clean_name
+        except OSError:
+            pass
+        return names
 
     @staticmethod
     def _extract_codex_metadata(path, size):
@@ -934,6 +1131,13 @@ class SessionIndex:
                             # id and cause the parent session to be shadowed.
                             if 'id' not in meta:
                                 meta['id'] = payload.get('id', '')
+                                for key in (
+                                    'thread_source', 'parent_thread_id',
+                                    'forked_from_id', 'agent_path', 'agent_nickname',
+                                ):
+                                    value = payload.get(key)
+                                    if isinstance(value, str):
+                                        meta[key] = value
                             if not meta.get('cwd'):
                                 meta['cwd'] = payload.get('cwd', '')
                             if not meta.get('version'):
@@ -2036,6 +2240,38 @@ class SessionIndex:
                 matched_ids.add(sid)
         matched_ids |= oc_ids
 
+        # Newer OpenClaw sessions live in SQLite and cannot be searched by rg.
+        if source in (None, 'openclaw'):
+            sqlite_dbs = {}
+            with self._lock:
+                indexed = list(self._sessions.items())
+            for sid, session in indexed:
+                ref = session.get('_path', '')
+                if not ref.startswith(OPENCLAW_SQLITE_PREFIX):
+                    continue
+                try:
+                    db_path, ref_sid = ref[len(OPENCLAW_SQLITE_PREFIX):].rsplit('#', 1)
+                except ValueError:
+                    continue
+                sqlite_dbs.setdefault(db_path, {})[ref_sid] = sid
+
+            for db_path, db_sessions in sqlite_dbs.items():
+                try:
+                    with sqlite3.connect(
+                        f'file:{db_path}?mode=ro', uri=True, timeout=2,
+                    ) as conn:
+                        rows = conn.execute(
+                            'SELECT DISTINCT session_id FROM transcript_events '
+                            'WHERE instr(event_json, ?) > 0',
+                            (query,),
+                        ).fetchall()
+                    for (ref_sid,) in rows:
+                        sid = db_sessions.get(ref_sid)
+                        if sid:
+                            matched_ids.add(sid)
+                except (OSError, sqlite3.Error):
+                    continue
+
         self._content_cache[cache_key] = {'ids': matched_ids, 'time': time.time()}
         return matched_ids
 
@@ -2166,6 +2402,43 @@ class SessionEventReader:
     _CODEX_TYPES = frozenset([
         'session_meta', 'response_item', 'event_msg', 'turn_context',
     ])
+
+    @staticmethod
+    def _openclaw_sqlite_ref(path):
+        """Return (database path, session ID) for an internal SQLite ref."""
+        value = str(path)
+        if not value.startswith(OPENCLAW_SQLITE_PREFIX):
+            return None
+        try:
+            db_path, session_id = value[len(OPENCLAW_SQLITE_PREFIX):].rsplit('#', 1)
+        except ValueError:
+            return None
+        if not db_path or not re.fullmatch(
+            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+            session_id,
+        ):
+            return None
+        return db_path, session_id
+
+    @classmethod
+    def _raw_event_lines(cls, path):
+        """Yield raw event JSON from either a JSONL file or OpenClaw SQLite."""
+        sqlite_ref = cls._openclaw_sqlite_ref(path)
+        if sqlite_ref:
+            db_path, session_id = sqlite_ref
+            with sqlite3.connect(
+                f'file:{db_path}?mode=ro', uri=True, timeout=2,
+            ) as conn:
+                for row in conn.execute(
+                    'SELECT event_json FROM transcript_events '
+                    'WHERE session_id = ? ORDER BY seq',
+                    (session_id,),
+                ):
+                    yield row[0]
+            return
+
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            yield from f
 
     @staticmethod
     def _is_codex_path(path):
@@ -2304,9 +2577,18 @@ class SessionEventReader:
 
         return converted
 
-    @staticmethod
-    def _select_converted(converted, prefix, after, limit, types):
+    @classmethod
+    def _select_converted(cls, converted, prefix, after, limit, types,
+                          before=None):
         """Cursor/limit/types selection over converted (key, event) pairs."""
+        if before:
+            m = re.match(rf'{prefix}-(\d+)$', str(before))
+            idx = int(m.group(1)) if m else -1
+            selected = [(k, ev) for k, ev in converted if k < idx]
+            return [
+                ev for _, ev in selected
+                if not types or ev['type'] in types
+            ][-limit:]
         if after:
             m = re.match(rf'{prefix}-(\d+)$', str(after))
             idx = int(m.group(1)) if m else -1
@@ -2319,7 +2601,8 @@ class SessionEventReader:
         ]
 
     @classmethod
-    def _read_hermes_events(cls, path, after=None, limit=100, types=None):
+    def _read_hermes_events(cls, path, after=None, before=None, limit=100,
+                            types=None):
         """Read a Hermes session JSON (OpenAI-style messages) into unified events."""
         try:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -2331,10 +2614,11 @@ class SessionEventReader:
         converted = cls._convert_openai_messages(
             'hmsg', pairs, data.get('model', ''))
         return cls._select_converted(
-            converted, 'hmsg', after, limit, types)
+            converted, 'hmsg', after, limit, types, before=before)
 
     @classmethod
-    def _read_hermes_state_events(cls, path, after=None, limit=100, types=None):
+    def _read_hermes_state_events(cls, path, after=None, before=None,
+                                  limit=100, types=None):
         """Read a live Hermes SessionDB session via the WSL bridge."""
         sid = str(path).split('://', 1)[1]
         msgs = _wsl_hermes_bridge(['msgs', sid], timeout=30)
@@ -2349,7 +2633,7 @@ class SessionEventReader:
             pairs.append((key, m))
         converted = cls._convert_openai_messages('hstate', pairs)
         return cls._select_converted(
-            converted, 'hstate', after, limit, types)
+            converted, 'hstate', after, limit, types, before=before)
 
     @classmethod
     def _get_hermes_stats(cls, path):
@@ -2480,35 +2764,128 @@ class SessionEventReader:
         }
 
     @classmethod
-    def read_events(cls, path, after=None, limit=100, types=None, full=False):
+    def read_events(cls, path, after=None, before=None, limit=100, types=None, full=False):
         events = []
         try:
+            if cls._openclaw_sqlite_ref(path):
+                return cls._read_openclaw_sqlite_events(
+                    path, after=after, before=before, limit=limit,
+                    types=types, full=full,
+                )
+
             if cls._is_opencode_path(path):
-                events = cls._read_opencode_events(path, after, limit, types)
+                events = cls._read_opencode_events(
+                    path, after=after, before=before, limit=limit, types=types)
             elif cls._is_legacy_opencode_path(path):
-                events = cls._read_opencode_legacy_events(path, after, limit, types)
+                events = cls._read_opencode_legacy_events(
+                    path, after=after, before=before, limit=limit, types=types)
             elif cls._is_hermes_state_path(path):
-                events = cls._read_hermes_state_events(path, after, limit, types)
+                events = cls._read_hermes_state_events(
+                    path, after=after, before=before, limit=limit, types=types)
             elif cls._is_hermes_session_path(path):
-                events = cls._read_hermes_events(path, after, limit, types)
+                events = cls._read_hermes_events(
+                    path, after=after, before=before, limit=limit, types=types)
             elif cls._is_hermes_bench_path(path):
-                events = cls._read_hermes_bench_events(path, after, limit, types)
+                events = cls._read_hermes_bench_events(
+                    path, after=after, before=before, limit=limit, types=types)
             else:
                 file_size = os.path.getsize(path)
                 if cls._is_codex_path(path):
-                    events = cls._read_codex_events(path, file_size, after, limit, types)
+                    events = cls._read_codex_events(
+                        path, file_size, after=after, before=before,
+                        limit=limit, types=types, full=full,
+                    )
                 elif cls._is_kimi_path(path):
-                    events = cls._read_kimi_events(path, file_size, after, limit, types)
+                    events = cls._read_kimi_events(
+                        path, file_size, after=after, before=before,
+                        limit=limit, types=types, full=full,
+                    )
+                elif before:
+                    events = cls._read_before_cursor(path, limit, types, before)
                 elif after:
                     events = cls._read_after_cursor(path, file_size, after, limit, types)
                 elif full:
                     events = cls._read_full(path, limit, types)
                 else:
                     events = cls._read_tail(path, file_size, limit, types)
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             print(f"Error reading session: {e}", file=sys.stderr)
 
         return events
+
+    @classmethod
+    def _read_openclaw_sqlite_events(cls, path, after=None, before=None,
+                                     limit=100, types=None, full=False):
+        """Read OpenClaw transcript events using stable sequence cursors."""
+        db_path, session_id = cls._openclaw_sqlite_ref(path)
+        clauses = ['session_id = ?']
+        params = [session_id]
+        reverse = False
+
+        if before and before.startswith('ocsql-'):
+            try:
+                clauses.append('seq < ?')
+                params.append(int(before[6:]))
+            except ValueError:
+                return []
+            order = 'DESC'
+            reverse = True
+        elif after and after.startswith('ocsql-'):
+            try:
+                clauses.append('seq > ?')
+                params.append(int(after[6:]))
+            except ValueError:
+                return []
+            order = 'ASC'
+        elif full:
+            order = 'ASC'
+        else:
+            order = 'DESC'
+            reverse = True
+
+        with sqlite3.connect(
+            f'file:{db_path}?mode=ro', uri=True, timeout=2,
+        ) as conn:
+            rows = conn.execute(
+                'SELECT seq, event_json FROM transcript_events WHERE '
+                + ' AND '.join(clauses) + f' ORDER BY seq {order}',
+                params,
+            ).fetchall()
+
+        events = []
+        for seq, line in rows:
+            ev = cls._parse_event(line)
+            if not ev or ev['type'] in cls._SKIP_TYPES:
+                continue
+            if types and ev['type'] not in types:
+                continue
+            ev['uuid'] = f'ocsql-{seq}'
+            events.append(ev)
+            if not reverse and len(events) >= limit:
+                break
+
+        if reverse:
+            events = list(reversed(events[:limit]))
+        return events
+
+    @classmethod
+    def _read_before_cursor(cls, path, limit, types, before):
+        """Read display events before a given UUID cursor."""
+        events = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ev = cls._parse_event(line)
+                if not ev or ev['type'] in cls._SKIP_TYPES:
+                    continue
+                if types and ev['type'] not in types:
+                    continue
+                if ev.get('uuid') == before:
+                    break
+                events.append(ev)
+        return events[-limit:]
 
     @classmethod
     def _read_full(cls, path, limit, types):
@@ -2639,9 +3016,44 @@ class SessionEventReader:
         return count
 
     @classmethod
-    def _read_codex_events(cls, path, file_size, after=None, limit=100, types=None):
+    def _read_codex_events(cls, path, file_size, after=None, before=None,
+                           limit=100, types=None, full=False):
         """Read events from a Codex JSONL file using line-number cursors."""
         events = []
+
+        if full:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                            if len(events) >= limit:
+                                break
+            return events
+
+        # Parse before cursor: "codex-<line_num>"
+        if before and before.startswith('codex-'):
+            try:
+                before_line = int(before.split('-', 1)[1])
+            except (ValueError, IndexError):
+                before_line = -1
+
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if line_num >= before_line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_codex_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+            return events[-limit:]
 
         # Parse after cursor: "codex-<line_num>"
         if after and after.startswith('codex-'):
@@ -2902,9 +3314,46 @@ class SessionEventReader:
     # ── Kimi event reading ────────────────────────────────────────────────
 
     @classmethod
-    def _read_kimi_events(cls, path, file_size, after=None, limit=100, types=None):
+    def _read_kimi_events(cls, path, file_size, after=None, before=None,
+                          limit=100, types=None, full=False):
         """Read events from a Kimi wire.jsonl file using line-number cursors."""
         events = []
+
+        if full:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+                            if len(events) >= limit:
+                                break
+            return events
+
+        if before and before.startswith('kimi-'):
+            try:
+                before_line = int(before[5:])
+            except (ValueError, IndexError):
+                return events
+
+            if before_line < 0:
+                return events
+
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line_num, line in enumerate(f):
+                    if line_num >= before_line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ev = cls._parse_kimi_event(line, line_num)
+                    if ev and ev['type'] not in cls._SKIP_TYPES:
+                        if not types or ev['type'] in types:
+                            events.append(ev)
+            return events[-limit:]
 
         if after and after.startswith('kimi-'):
             try:
@@ -2933,7 +3382,7 @@ class SessionEventReader:
                             break
             return events
 
-        # For large files, tail-read to avoid loading entire file
+        # For large files, tail-read but keep exact line-number cursors.
         if file_size > TAIL_READ_BYTES:
             with open(path, 'rb') as f:
                 seek_back = min(file_size, TAIL_READ_BYTES)
@@ -3245,7 +3694,8 @@ class SessionEventReader:
     # ── OpenCode event reading (SQLite) ────────────────────────────────
 
     @classmethod
-    def _read_opencode_events(cls, path, after=None, limit=100, types=None):
+    def _read_opencode_events(cls, path, after=None, before=None, limit=100,
+                              types=None):
         """Read OpenCode messages/parts from SQLite into unified events."""
         ses_id = str(path).split('::', 1)[1]
         events = []
@@ -3263,8 +3713,17 @@ class SessionEventReader:
             ).fetchall()
 
             skipping = bool(after)
+            stop_before = None
+            if before:
+                # before cursor is 'ocmsg-<msg_id>' or 'ocmsg-<msg_id>-trN';
+                # emit only messages strictly before that one
+                stop_before = re.sub(r'-tr\d+$', '', str(before))
+                if not stop_before.startswith('ocmsg-'):
+                    stop_before = None
             for msg_id, t_created, data_raw in rows:
                 uuid = 'ocmsg-' + msg_id
+                if stop_before and uuid == stop_before:
+                    break
                 if skipping:
                     if after == uuid or after.startswith(uuid + '-tr'):
                         skipping = False
@@ -3311,7 +3770,8 @@ class SessionEventReader:
         return events
 
     @classmethod
-    def _read_opencode_legacy_events(cls, path, after=None, limit=100, types=None):
+    def _read_opencode_legacy_events(cls, path, after=None, before=None,
+                                     limit=100, types=None):
         """Read messages/parts from the legacy OpenCode JSON store."""
         ses_id = str(path).split('::', 1)[1]
         events = []
@@ -3331,9 +3791,16 @@ class SessionEventReader:
             msgs.append((t, mf.stem, d))
         msgs.sort(key=lambda x: (x[0], x[1]))
 
+        stop_before = None
+        if before:
+            stop_before = re.sub(r'-tr\d+$', '', str(before))
+            if not stop_before.startswith('ocmsg-'):
+                stop_before = None
         skipping = bool(after)
         for t_created, _name, mdata in msgs:
             uuid = 'ocmsg-' + mdata.get('id', _name)
+            if stop_before and uuid == stop_before:
+                break
             if skipping:
                 if after == uuid or after.startswith(uuid + '-tr'):
                     skipping = False
@@ -3548,7 +4015,8 @@ class SessionEventReader:
         return q_event, a_event
 
     @classmethod
-    def _read_hermes_bench_events(cls, path, after=None, limit=100, types=None):
+    def _read_hermes_bench_events(cls, path, after=None, before=None,
+                                  limit=100, types=None):
         """Read a Hermes eval run directory into unified events."""
         run_dir = Path(path)
 
@@ -3561,7 +4029,8 @@ class SessionEventReader:
 
         # Run config summary
         cfg_uuid = 'bench-config'
-        show_config = not after and (not types or 'assistant' in types)
+        show_config = not after and before != cfg_uuid and \
+            (not types or 'assistant' in types)
         if show_config:
             cfg_lines = []
             if isinstance(manifest, dict):
@@ -3607,6 +4076,14 @@ class SessionEventReader:
             # 'bench-config' → after_idx stays -1 (config is emitted above
             # only on the initial load, so nothing to skip)
 
+        before_idx = None
+        if before:
+            m = re.match(r'bench-(\d+)-[qa]$', before)
+            if m:
+                before_idx = int(m.group(1))
+            elif before == 'bench-config':
+                before_idx = -1   # nothing strictly before the config event
+
         remaining = max(0, limit - len(events))
         reached_eof = True
         for pf in pred_files:
@@ -3615,6 +4092,9 @@ class SessionEventReader:
                     for i, line in enumerate(f):
                         if i <= after_idx:
                             continue
+                        if before_idx is not None and i >= before_idx:
+                            reached_eof = False
+                            break
                         line = line.strip()
                         if not line:
                             continue
@@ -3693,8 +4173,8 @@ class SessionEventReader:
 
     # ── inline subagent scanning (OpenClaw sessions_spawn) ──────────────
 
-    @staticmethod
-    def scan_inline_subagents(path):
+    @classmethod
+    def scan_inline_subagents(cls, path):
         """Parse sessions_spawn tool calls to find ephemeral subagents.
 
         OpenClaw subagents are spawned via the sessions_spawn tool and don't
@@ -3705,60 +4185,59 @@ class SessionEventReader:
         results = {} # toolCallId -> {status, childSessionKey, runId, error}
 
         try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or 'sessions_spawn' not in line:
-                        continue
-                    try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            for line in cls._raw_event_lines(path):
+                line = line.strip()
+                if not line or 'sessions_spawn' not in line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    msg = raw.get('message', {})
-                    role = msg.get('role', '')
-                    content = msg.get('content', [])
-                    ts = raw.get('timestamp', '')
+                msg = raw.get('message', {})
+                role = msg.get('role', '')
+                content = msg.get('content', [])
+                ts = raw.get('timestamp', '')
 
-                    # Assistant message with toolCall blocks
+                # Assistant message with toolCall blocks
+                if isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict)
+                                and block.get('type') == 'toolCall'
+                                and block.get('name') == 'sessions_spawn'):
+                            cid = block.get('id', '')
+                            args = block.get('arguments', {})
+                            calls[cid] = {
+                                'task': args.get('task', ''),
+                                'model': args.get('model', ''),
+                                'mode': args.get('mode', 'run'),
+                                'timestamp': ts,
+                            }
+
+                # toolResult role
+                if role == 'toolResult' and msg.get('toolName') == 'sessions_spawn':
+                    tcid = msg.get('toolCallId', '')
+                    rc = ''
                     if isinstance(content, list):
-                        for block in content:
-                            if (isinstance(block, dict)
-                                    and block.get('type') == 'toolCall'
-                                    and block.get('name') == 'sessions_spawn'):
-                                cid = block.get('id', '')
-                                args = block.get('arguments', {})
-                                calls[cid] = {
-                                    'task': args.get('task', ''),
-                                    'model': args.get('model', ''),
-                                    'mode': args.get('mode', 'run'),
-                                    'timestamp': ts,
-                                }
+                        for b in content:
+                            if isinstance(b, dict) and b.get('type') == 'text':
+                                rc = b.get('text', '')
+                                break
+                    elif isinstance(content, str):
+                        rc = content
+                    if rc:
+                        try:
+                            parsed = json.loads(rc)
+                            results[tcid] = {
+                                'status': parsed.get('status', ''),
+                                'childSessionKey': parsed.get('childSessionKey', ''),
+                                'runId': parsed.get('runId', ''),
+                                'error': parsed.get('error', ''),
+                            }
+                        except (json.JSONDecodeError, KeyError):
+                            pass
 
-                    # toolResult role
-                    if role == 'toolResult' and msg.get('toolName') == 'sessions_spawn':
-                        tcid = msg.get('toolCallId', '')
-                        rc = ''
-                        if isinstance(content, list):
-                            for b in content:
-                                if isinstance(b, dict) and b.get('type') == 'text':
-                                    rc = b.get('text', '')
-                                    break
-                        elif isinstance(content, str):
-                            rc = content
-                        if rc:
-                            try:
-                                parsed = json.loads(rc)
-                                results[tcid] = {
-                                    'status': parsed.get('status', ''),
-                                    'childSessionKey': parsed.get('childSessionKey', ''),
-                                    'runId': parsed.get('runId', ''),
-                                    'error': parsed.get('error', ''),
-                                }
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-
-        except OSError:
+        except (OSError, sqlite3.Error):
             return []
 
         # Build subagent list from paired calls + results (accepted only)
@@ -3796,8 +4275,6 @@ class SessionEventReader:
             })
 
         return subagents
-
-    # ── raw event & stats ─────────────────────────────────────────────────
 
     # ── raw event & stats ─────────────────────────────────────────────────
 
@@ -3933,6 +4410,25 @@ class SessionEventReader:
                     pass
             return None
         try:
+            sqlite_ref = cls._openclaw_sqlite_ref(path)
+            if sqlite_ref:
+                if not event_uuid.startswith('ocsql-'):
+                    return None
+                try:
+                    seq = int(event_uuid[6:])
+                except ValueError:
+                    return None
+                db_path, session_id = sqlite_ref
+                with sqlite3.connect(
+                    f'file:{db_path}?mode=ro', uri=True, timeout=2,
+                ) as conn:
+                    row = conn.execute(
+                        'SELECT event_json FROM transcript_events '
+                        'WHERE session_id = ? AND seq = ?',
+                        (session_id, seq),
+                    ).fetchone()
+                return json.loads(row[0]) if row else None
+
             # Codex/Kimi: line-number based lookup
             for prefix in ('codex-', 'kimi-'):
                 if event_uuid.startswith(prefix):
@@ -3968,10 +4464,11 @@ class SessionEventReader:
                             return obj
                     except json.JSONDecodeError:
                         pass
-        except OSError:
+        except (OSError, sqlite3.Error, json.JSONDecodeError):
             pass
         return None
 
+    @classmethod
     @classmethod
     def _get_opencode_stats(cls, path):
         ses_id = str(path).split('::', 1)[1]
@@ -4241,37 +4738,37 @@ class SessionEventReader:
         first_ts = last_ts = None
 
         try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            for line in cls._raw_event_lines(path):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    et = raw.get('type', '')
-                    stats['event_counts'][et] = stats['event_counts'].get(et, 0) + 1
+                et = raw.get('type', '')
+                stats['event_counts'][et] = stats['event_counts'].get(et, 0) + 1
 
-                    ts = raw.get('timestamp', '')
-                    if ts:
-                        if isinstance(ts, (int, float)):
-                            ts = datetime.fromtimestamp(
-                                ts / 1000 if ts > 1e12 else ts
-                            ).isoformat()
-                        if first_ts is None:
-                            first_ts = ts
-                        last_ts = ts
+                ts = raw.get('timestamp', '')
+                if ts:
+                    if isinstance(ts, (int, float)):
+                        ts = datetime.fromtimestamp(
+                            ts / 1000 if ts > 1e12 else ts
+                        ).isoformat()
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
 
-                    if not stats['cwd'] and raw.get('cwd'):
-                        stats['cwd'] = raw['cwd']
-                    if not stats['gitBranch'] and raw.get('gitBranch'):
-                        stats['gitBranch'] = raw['gitBranch']
-                    if not stats['version'] and raw.get('version'):
-                        stats['version'] = str(raw['version'])
+                if not stats['cwd'] and raw.get('cwd'):
+                    stats['cwd'] = raw['cwd']
+                if not stats['gitBranch'] and raw.get('gitBranch'):
+                    stats['gitBranch'] = raw['gitBranch']
+                if not stats['version'] and raw.get('version'):
+                    stats['version'] = str(raw['version'])
 
-                    msg = raw.get('message', {})
+                msg = raw.get('message', {})
+                if isinstance(msg, dict):
 
                     # Claude Code native: type == 'assistant'
                     if et == 'assistant':
@@ -4386,7 +4883,7 @@ class SessionEventReader:
                         name = raw.get('name', '') or (raw.get('payload') or {}).get('name', 'unknown')
                         stats['tool_calls'][name] = stats['tool_calls'].get(name, 0) + 1
 
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             print(f"Error reading stats: {e}", file=sys.stderr)
 
         stats['first_timestamp'] = first_ts or ''
@@ -4519,13 +5016,15 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             after = qs.get('after', [None])[0]
+            before = qs.get('before', [None])[0]
             full = qs.get('full', [''])[0] == '1'
             limit = min(self._qint(qs, 'limit', 100), 10000 if full else 500)
             types_raw = qs.get('types', [None])[0]
             types = set(types_raw.split(',')) if types_raw else None
 
             events = SessionEventReader.read_events(
-                path, after=after, limit=limit, types=types, full=full,
+                path, after=after, before=before,
+                limit=limit, types=types, full=full,
             )
             self.send_json({'events': events, 'sessionId': session_id})
         except Exception as e:
@@ -4963,9 +5462,10 @@ class TrackerAPIHandler(http.server.SimpleHTTPRequestHandler):
         return history
 
     def log_message(self, format, *args):
-        if '/api/' not in args[0]:
+        request_line = str(args[0]) if args else format
+        if '/api/' not in request_line:
             return
-        print(f"[API] {args[0]}")
+        print(f"[API] {request_line}")
 
 
 # ─── Server ────────────────────────────────────────────────────────────────────
