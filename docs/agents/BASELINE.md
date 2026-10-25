@@ -45,6 +45,24 @@ agente faria os outros herdarem comportamento que não é deles.
   rapidamente se já existe solução open-source, biblioteca mantida ou recurso
   nativo adequado. Não recomendar serviço pago sem aprovação de gasto.
 
+<!-- BEGIN MANAGED TEST DISCIPLINE -->
+## Test Discipline
+
+- Always run relevant existing tests and keep them green.
+- Do not create unit or integration tests by default, especially tests that
+  merely restate the implementation.
+- Add a focused regression test when it independently captures observable
+  behavior: a reproducible bug, explicit contract, stable boundary, or
+  important edge case.
+- If a new test would not provide independent validation or is impractical,
+  explain why in the PR or hand-off.
+- Prefer tests of externally observable behavior over tests coupled to
+  implementation details.
+- Never weaken, remove, or rewrite valid existing tests merely to make the
+  implementation pass.
+- Explicit repository-specific test requirements still prevail.
+<!-- END MANAGED TEST DISCIPLINE -->
+
 ## Escreva, Não Memorize
 
 Memória de sessão não sobrevive a restart; arquivo sobrevive. Decisão
